@@ -5,7 +5,10 @@ import os
 import re
 import gzip
 import mimetypes
-import threading
+try:
+    import threading
+except ImportError:
+    import dummy_threading as threading
 import posixpath
 import pkg_resources
 import random
@@ -15,7 +18,7 @@ import zlib
 from pip.log import logger
 from pip.util import Inf
 from pip.util import normalize_name, splitext
-from pip.exceptions import DistributionNotFound
+from pip.exceptions import DistributionNotFound, BestVersionAlreadyInstalled
 from pip.backwardcompat import (WindowsError, BytesIO,
                                 Queue, httplib, urlparse,
                                 URLError, HTTPError, u,
@@ -26,7 +29,7 @@ from pip.download import urlopen, path_to_url2, url_to_path, geturl, Urllib2Head
 __all__ = ['PackageFinder']
 
 
-DEFAULT_MIRROR_URL = "last.pypi.python.org"
+DEFAULT_MIRROR_HOSTNAME = "last.pypi.python.org"
 
 
 class PackageFinder(object):
@@ -172,6 +175,7 @@ class PackageFinder(object):
             if applicable_versions[0][1] is Inf:
                 logger.info('Existing installed version (%s) is most up-to-date and satisfies requirement'
                             % req.satisfied_by.version)
+                raise BestVersionAlreadyInstalled
             else:
                 logger.info('Existing installed version (%s) satisfies requirement (most up-to-date version is %s)'
                             % (req.satisfied_by.version, applicable_versions[0][1]))
@@ -184,7 +188,7 @@ class PackageFinder(object):
             # We have an existing version, and its the best version
             logger.info('Installed version (%s) is most up-to-date (past versions: %s)'
                         % (req.satisfied_by.version, ', '.join([version for link, version in applicable_versions[1:]]) or 'none'))
-            return None
+            raise BestVersionAlreadyInstalled
         if len(applicable_versions) > 1:
             logger.info('Using version %s (newest of versions: %s)' %
                         (applicable_versions[0][1], ', '.join([version for link, version in applicable_versions])))
@@ -247,7 +251,7 @@ class PackageFinder(object):
 
     _egg_fragment_re = re.compile(r'#egg=([^&]*)')
     _egg_info_re = re.compile(r'([a-z0-9_.]+)-([a-z0-9_.-]+)', re.I)
-    _py_version_re = re.compile(r'-py([123]\.[0-9])$')
+    _py_version_re = re.compile(r'-py([123]\.?[0-9]?)$')
 
     def _sort_links(self, links):
         "Returns elements of links in order, non-egg links first, egg links second, while eliminating duplicates"
@@ -293,6 +297,11 @@ class PackageFinder(object):
                     logger.debug('Skipping link %s; unknown archive format: %s' % (link, ext))
                     self.logged_links.add(link)
                 return []
+            if "macosx10" in link.path and ext == '.zip':
+                if link not in self.logged_links:
+                    logger.debug('Skipping link %s; macosx10 one' % (link))
+                    self.logged_links.add(link)
+                return []
         version = self._egg_info_matches(egg_info, search_name, link)
         if version is None:
             logger.debug('Skipping link %s; wrong project name (not %s)' % (link, search_name))
@@ -317,8 +326,10 @@ class PackageFinder(object):
         name = match.group(0).lower()
         # To match the "safe" name that pkg_resources creates:
         name = name.replace('_', '-')
-        if name.startswith(search_name.lower()):
-            return match.group(0)[len(search_name):].lstrip('-')
+        # project name and version must be separated by a dash
+        look_for = search_name.lower() + "-"
+        if name.startswith(look_for):
+            return match.group(0)[len(look_for):]
         else:
             return None
 
@@ -549,7 +560,7 @@ class HTMLPage(object):
             href_match = self._href_re.search(self.content, pos=match.end())
             if not href_match:
                 continue
-            url = match.group(1) or match.group(2) or match.group(3)
+            url = href_match.group(1) or href_match.group(2) or href_match.group(3)
             if not url:
                 continue
             url = self.clean_link(urlparse.urljoin(self.base_url, url))
@@ -588,9 +599,9 @@ class Link(object):
 
     @property
     def filename(self):
-        url = self.url_fragment
-        name = posixpath.basename(url)
-        assert name, ('URL %r produced no filename' % url)
+        _, netloc, path, _, _ = urlparse.urlsplit(self.url)
+        name = posixpath.basename(path.rstrip('/')) or netloc
+        assert name, ('URL %r produced no filename' % self.url)
         return name
 
     @property
@@ -605,12 +616,9 @@ class Link(object):
         return splitext(posixpath.basename(self.path.rstrip('/')))
 
     @property
-    def url_fragment(self):
-        url = self.url
-        url = url.split('#', 1)[0]
-        url = url.split('?', 1)[0]
-        url = url.rstrip('/')
-        return url
+    def url_without_fragment(self):
+        scheme, netloc, path, query, fragment = urlparse.urlsplit(self.url)
+        return urlparse.urlunsplit((scheme, netloc, path, query, None))
 
     _egg_fragment_re = re.compile(r'#egg=([^&]*)')
 
@@ -621,11 +629,18 @@ class Link(object):
             return None
         return match.group(1)
 
-    _md5_re = re.compile(r'md5=([a-f0-9]+)')
+    _hash_re = re.compile(r'(sha1|sha224|sha384|sha256|sha512|md5)=([a-f0-9]+)')
 
     @property
-    def md5_hash(self):
-        match = self._md5_re.search(self.url)
+    def hash(self):
+        match = self._hash_re.search(self.url)
+        if match:
+            return match.group(2)
+        return None
+
+    @property
+    def hash_name(self):
+        match = self._hash_re.search(self.url)
         if match:
             return match.group(1)
         return None
@@ -672,14 +687,17 @@ def get_mirrors(hostname=None):
     Originally written for the distutils2 project by Alexis Metaireau.
     """
     if hostname is None:
-        hostname = DEFAULT_MIRROR_URL
+        hostname = DEFAULT_MIRROR_HOSTNAME
 
     # return the last mirror registered on PyPI.
+    last_mirror_hostname = None
     try:
-        hostname = socket.gethostbyname_ex(hostname)[0]
+        last_mirror_hostname = socket.gethostbyname_ex(hostname)[0]
     except socket.gaierror:
         return []
-    end_letter = hostname.split(".", 1)
+    if not last_mirror_hostname or last_mirror_hostname == DEFAULT_MIRROR_HOSTNAME:
+        last_mirror_hostname = "z.pypi.python.org"
+    end_letter = last_mirror_hostname.split(".", 1)
 
     # determine the list from the last one.
     return ["%s.%s" % (s, end_letter[1]) for s in string_range(end_letter[0])]

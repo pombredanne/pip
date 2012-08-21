@@ -49,15 +49,11 @@ sys.path = [src_folder] + sys.path
 
 
 def create_virtualenv(where, distribute=False):
-    save_argv = sys.argv
-
-    try:
-        import virtualenv
-        distribute_opt = distribute and ['--distribute'] or []
-        sys.argv = ['virtualenv', '--quiet'] + distribute_opt + ['--no-site-packages', '--unzip-setuptools', where]
-        virtualenv.main()
-    finally:
-        sys.argv = save_argv
+    import virtualenv
+    if sys.version_info[0] > 2:
+        distribute = True
+    virtualenv.create_environment(
+        where, use_distribute=distribute, unzip_setuptools=True)
 
     return virtualenv.path_locations(where)
 
@@ -106,13 +102,30 @@ def install_setuptools(env):
 env = None
 
 
-def reset_env(environ=None, use_distribute=None):
+def reset_env(environ=None, use_distribute=None, system_site_packages=False, sitecustomize=None):
+    """Return a test environment.
+
+    Keyword arguments:
+    environ: an environ object to use.
+    use_distribute: use distribute, not setuptools.
+    system_site_packages: create a virtualenv that simulates --system-site-packages.
+    sitecustomize: a string containing python code to add to sitecustomize.py.
+    """
+
     global env
     # FastTestPipEnv reuses env, not safe if use_distribute specified
-    if use_distribute is None:
-        env = FastTestPipEnvironment(environ)
+    if use_distribute is None and not system_site_packages:
+        env = FastTestPipEnvironment(environ, sitecustomize=sitecustomize)
     else:
-        env = TestPipEnvironment(environ, use_distribute=use_distribute)
+        env = TestPipEnvironment(environ, use_distribute=use_distribute, sitecustomize=sitecustomize)
+
+    if system_site_packages:
+        #testing often occurs starting from a private virtualenv (e.g. with tox)
+        #from that context, you can't successfully use virtualenv.create_environment
+        #to create a 'system-site-packages' virtualenv
+        #hence, this workaround
+        (env.lib_path/'no-global-site-packages.txt').rm()
+
     return env
 
 
@@ -266,7 +279,7 @@ class TestPipEnvironment(TestFileEnvironment):
 
     verbose = False
 
-    def __init__(self, environ=None, use_distribute=None):
+    def __init__(self, environ=None, use_distribute=None, sitecustomize=None):
 
         self.root_path = Path(tempfile.mkdtemp('-piptest'))
 
@@ -293,19 +306,26 @@ class TestPipEnvironment(TestFileEnvironment):
 
         if use_distribute is None:
             use_distribute = os.environ.get('PIP_TEST_USE_DISTRIBUTE', False)
+        self.use_distribute = use_distribute
 
         # Create a virtualenv and remember where it's putting things.
-        virtualenv_paths = create_virtualenv(self.venv_path, distribute=use_distribute)
+        virtualenv_paths = create_virtualenv(self.venv_path, distribute=self.use_distribute)
 
         assert self.venv_path == virtualenv_paths[0] # sanity check
 
         for id, path in zip(('venv', 'lib', 'include', 'bin'), virtualenv_paths):
+            #fix for virtualenv issue #306
+            if hasattr(sys, "pypy_version_info") and id == 'lib':
+                path = os.path.join(self.venv_path, 'lib-python', pyversion)
             setattr(self, id+'_path', Path(path))
             setattr(self, id, relpath(self.root_path, path))
 
         assert self.venv == TestPipEnvironment.venv # sanity check
 
-        self.site_packages = self.lib/'site-packages'
+        if hasattr(sys, "pypy_version_info"):
+            self.site_packages = self.venv/'site-packages'
+        else:
+            self.site_packages = self.lib/'site-packages'
         self.user_base_path = self.venv_path/'user'
         self.user_site_path = self.venv_path/'user'/site_packages_suffix
 
@@ -329,7 +349,7 @@ class TestPipEnvironment(TestFileEnvironment):
                 " rather than expected %r" % (pythonbin, self.bin_path/'python'))
 
         # make sure we have current setuptools to avoid svn incompatibilities
-        if not use_distribute:
+        if not self.use_distribute:
             install_setuptools(self)
 
         # Uninstall whatever version of pip came with the virtualenv.
@@ -341,7 +361,16 @@ class TestPipEnvironment(TestFileEnvironment):
 
         # Install this version instead
         self.run('python', 'setup.py', 'install', cwd=src_folder, expect_stderr=True)
+
+        #create sitecustomize.py and add patches
+        self._create_empty_sitecustomize()
         self._use_cached_pypi_server()
+        if sitecustomize:
+            self._add_to_sitecustomize(sitecustomize)
+
+        # Ensure that $TMPDIR exists  (because we use start_clear=False, it's not created for us)
+        if self.temp_path and not os.path.exists(self.temp_path):
+            os.makedirs(self.temp_path)
 
     def _ignore_file(self, fn):
         if fn.endswith('__pycache__') or fn.endswith(".pyc"):
@@ -364,21 +393,41 @@ class TestPipEnvironment(TestFileEnvironment):
         rmtree(str(self.root_path), ignore_errors=True)
 
     def _use_cached_pypi_server(self):
-        site_packages = self.root_path / self.site_packages
-        pth = open(os.path.join(site_packages, 'pypi_intercept.pth'), 'w')
-        pth.write('import sys; ')
-        pth.write('sys.path.insert(0, %r); ' % str(here))
-        pth.write('import pypi_server; pypi_server.PyPIProxy.setup(); ')
-        pth.write('sys.path.remove(%r); ' % str(here))
-        pth.close()
+        # previously, this was handled in a pth file, and not in sitecustomize.py
+        # pth processing happens during the construction of sys.path.
+        # 'import pypi_server' ultimately imports pkg_resources (which intializes pkg_resources.working_set based on the current state of sys.path)
+        # pkg_resources.get_distribution (used in pip.req) requires an accurate pkg_resources.working_set
+        # therefore, 'import pypi_server' shouldn't occur in a pth file.
 
+        patch = """
+            import sys
+            sys.path.insert(0, %r)
+            import pypi_server
+            pypi_server.PyPIProxy.setup()
+            sys.path.remove(%r)""" % (str(here), str(here))
+        self._add_to_sitecustomize(patch)
+
+    def _create_empty_sitecustomize(self):
+        "Create empty sitecustomize.py."
+        sitecustomize_path = self.lib_path / 'sitecustomize.py'
+        sitecustomize = open(sitecustomize_path, 'w')
+        sitecustomize.close()
+
+    def _add_to_sitecustomize(self, snippet):
+        "Adds a python code snippet to sitecustomize.py."
+        sitecustomize_path = self.lib_path / 'sitecustomize.py'
+        sitecustomize = open(sitecustomize_path, 'a')
+        sitecustomize.write(textwrap.dedent('''
+                               %s
+        ''' %snippet))
+        sitecustomize.close()
 
 fast_test_env_root = here / 'tests_cache' / 'test_ws'
 fast_test_env_backup = here / 'tests_cache' / 'test_ws_backup'
 
 
 class FastTestPipEnvironment(TestPipEnvironment):
-    def __init__(self, environ=None):
+    def __init__(self, environ=None, sitecustomize=None):
         import virtualenv
 
         self.root_path = fast_test_env_root
@@ -405,12 +454,18 @@ class FastTestPipEnvironment(TestPipEnvironment):
         virtualenv_paths = virtualenv.path_locations(self.venv_path)
 
         for id, path in zip(('venv', 'lib', 'include', 'bin'), virtualenv_paths):
+            #fix for virtualenv issue #306
+            if hasattr(sys, "pypy_version_info") and id == 'lib':
+                path = os.path.join(self.venv_path, 'lib-python', pyversion)
             setattr(self, id+'_path', Path(path))
             setattr(self, id, relpath(self.root_path, path))
 
         assert self.venv == TestPipEnvironment.venv # sanity check
 
-        self.site_packages = self.lib/'site-packages'
+        if hasattr(sys, "pypy_version_info"):
+            self.site_packages = self.venv/'site-packages'
+        else:
+            self.site_packages = self.lib/'site-packages'
         self.user_base_path = self.venv_path/'user'
         self.user_site_path = self.venv_path/'user'/'lib'/self.lib.name/'site-packages'
 
@@ -421,6 +476,8 @@ class FastTestPipEnvironment(TestPipEnvironment):
         # put the test-scratch virtualenv's bin dir first on the PATH
         self.environ['PATH'] = Path.pathsep.join((self.bin_path, self.environ['PATH']))
 
+        self.use_distribute = os.environ.get('PIP_TEST_USE_DISTRIBUTE', False)
+
         if self.root_path.exists:
             rmtree(self.root_path)
         if self.backup_path.exists:
@@ -429,10 +486,8 @@ class FastTestPipEnvironment(TestPipEnvironment):
             demand_dirs(self.venv_path)
             demand_dirs(self.scratch_path)
 
-            use_distribute = os.environ.get('PIP_TEST_USE_DISTRIBUTE', False)
-
             # Create a virtualenv and remember where it's putting things.
-            create_virtualenv(self.venv_path, distribute=use_distribute)
+            create_virtualenv(self.venv_path, distribute=self.use_distribute)
 
             demand_dirs(self.user_site_path)
 
@@ -449,7 +504,7 @@ class FastTestPipEnvironment(TestPipEnvironment):
                     " rather than expected %r" % (pythonbin, self.bin_path/'python'))
 
             # make sure we have current setuptools to avoid svn incompatibilities
-            if not use_distribute:
+            if not self.use_distribute:
                 install_setuptools(self)
 
             # Uninstall whatever version of pip came with the virtualenv.
@@ -462,8 +517,18 @@ class FastTestPipEnvironment(TestPipEnvironment):
             # Install this version instead
             self.run('python', 'setup.py', 'install', cwd=src_folder, expect_stderr=True)
             shutil.copytree(self.root_path, self.backup_path, True)
+
+        #create sitecustomize.py and add patches
+        self._create_empty_sitecustomize()
         self._use_cached_pypi_server()
+        if sitecustomize:
+            self._add_to_sitecustomize(sitecustomize)
+
         assert self.root_path.exists
+
+        # Ensure that $TMPDIR exists (because we use start_clear=False, it's not created for us)
+        if self.temp_path and not os.path.exists(self.temp_path):
+            os.makedirs(self.temp_path)
 
     def __del__(self):
         pass # shutil.rmtree(str(self.root_path), ignore_errors=True)
@@ -610,6 +675,7 @@ def _change_test_package_version(env, version_pkg_path):
     write_file('version_pkg.py', textwrap.dedent('''\
         def main():
             print("some different version")'''), version_pkg_path)
+    env.run('git', 'clean', '-qfdx', cwd=version_pkg_path, expect_stderr=True)
     env.run('git', 'commit', '-q',
             '--author', 'Pip <python-virtualenv@googlegroups.com>',
             '-am', 'messed version',
@@ -617,5 +683,5 @@ def _change_test_package_version(env, version_pkg_path):
 
 
 if __name__ == '__main__':
-    sys.stderr.write("Run pip's tests using nosetests. Requires virtualenv, ScriptTest, and nose.\n")
+    sys.stderr.write("Run pip's tests using nosetests. Requires virtualenv, ScriptTest, mock, and nose.\n")
     sys.exit(1)

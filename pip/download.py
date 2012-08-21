@@ -1,17 +1,18 @@
 import cgi
 import getpass
+import hashlib
 import mimetypes
 import os
 import re
 import shutil
 import sys
 import tempfile
-from pip.backwardcompat import (md5, copytree, xmlrpclib, urllib, urllib2,
-                                urlparse, string_types, HTTPError)
+from pip.backwardcompat import (xmlrpclib, urllib, urllib2,
+                                urlparse, string_types)
 from pip.exceptions import InstallationError
-from pip.util import (splitext, rmtree,
-                      format_size, display_path, backup_dir, ask,
-                      unpack_file, create_download_cache_folder, cache_download)
+from pip.util import (splitext, rmtree, format_size, display_path,
+                      backup_dir, ask_path_exists, unpack_file,
+                      create_download_cache_folder, cache_download)
 from pip.vcs import vcs
 from pip.log import logger
 
@@ -132,7 +133,7 @@ class URLOpener(object):
         self.prompting = prompting
         proxy = self.get_proxy(proxystr)
         if proxy:
-            proxy_support = urllib2.ProxyHandler({"http": proxy, "ftp": proxy})
+            proxy_support = urllib2.ProxyHandler({"http": proxy, "ftp": proxy, "https": proxy})
             opener = urllib2.build_opener(proxy_support, urllib2.CacheFTPHandler)
             urllib2.install_opener(opener)
 
@@ -301,7 +302,7 @@ def unpack_file_url(link, location):
         # delete the location since shutil will create it again :(
         if os.path.isdir(location):
             rmtree(location)
-        copytree(source, location)
+        shutil.copytree(source, location)
     else:
         unpack_file(source, location, content_type, link)
 
@@ -321,16 +322,24 @@ def is_file_url(link):
     return link.url.lower().startswith('file:')
 
 
-def _check_md5(download_hash, link):
-    download_hash = download_hash.hexdigest()
-    if download_hash != link.md5_hash:
-        logger.fatal("MD5 hash of the package %s (%s) doesn't match the expected hash %s!"
-                     % (link, download_hash, link.md5_hash))
-        raise InstallationError('Bad MD5 hash for package %s' % link)
+def _check_hash(download_hash, link):
+    if download_hash.digest_size != hashlib.new(link.hash_name).digest_size:
+        logger.fatal("Hash digest size of the package %d (%s) doesn't match the expected hash name %s!"
+                    % (download_hash.digest_size, link, link.hash_name))
+        raise InstallationError('Hash name mismatch for package %s' % link)
+    if download_hash.hexdigest() != link.hash:
+        logger.fatal("Hash of the package %s (%s) doesn't match the expected hash %s!"
+                     % (link, download_hash, link.hash))
+        raise InstallationError('Bad %s hash for package %s' % (link.hash_name, link))
 
 
-def _get_md5_from_file(target_file, link):
-    download_hash = md5()
+def _get_hash_from_file(target_file, link):
+    try:
+        download_hash = hashlib.new(link.hash_name)
+    except (ValueError, TypeError):
+        logger.warn("Unsupported hash name %s for package %s" % (link.hash_name, link))
+        return None
+
     fp = open(target_file, 'rb')
     while True:
         chunk = fp.read(4096)
@@ -344,8 +353,11 @@ def _get_md5_from_file(target_file, link):
 def _download_url(resp, link, temp_location):
     fp = open(temp_location, 'wb')
     download_hash = None
-    if link.md5_hash:
-        download_hash = md5()
+    if link.hash and link.hash_name:
+        try:
+            download_hash = hashlib.new(link.hash_name)
+        except ValueError:
+            logger.warn("Unsupported hash name %s for package %s" % (link.hash_name, link))
     try:
         total_length = int(resp.info()['content-length'])
     except (ValueError, KeyError, TypeError):
@@ -374,7 +386,7 @@ def _download_url(resp, link, temp_location):
                     logger.show_progress('%s' % format_size(downloaded))
                 else:
                     logger.show_progress('%3i%%  %s' % (100*downloaded/total_length, format_size(downloaded)))
-            if link.md5_hash:
+            if download_hash is not None:
                 download_hash.update(chunk)
             fp.write(chunk)
         fp.close()
@@ -388,8 +400,9 @@ def _copy_file(filename, location, content_type, link):
     copy = True
     download_location = os.path.join(location, link.filename)
     if os.path.exists(download_location):
-        response = ask('The file %s exists. (i)gnore, (w)ipe, (b)ackup '
-                       % display_path(download_location), ('i', 'w', 'b'))
+        response = ask_path_exists(
+            'The file %s exists. (i)gnore, (w)ipe, (b)ackup ' %
+            display_path(download_location), ('i', 'w', 'b'))
         if response == 'i':
             copy = False
         elif response == 'w':
@@ -406,7 +419,7 @@ def _copy_file(filename, location, content_type, link):
         logger.notify('Saved %s' % display_path(download_location))
 
 
-def unpack_http_url(link, location, download_cache, only_download):
+def unpack_http_url(link, location, download_cache, download_dir=None):
     temp_dir = tempfile.mkdtemp('-unpack', 'pip-')
     target_url = link.url.split('#', 1)[0]
     target_file = None
@@ -422,8 +435,8 @@ def unpack_http_url(link, location, download_cache, only_download):
         fp = open(target_file+'.content-type')
         content_type = fp.read().strip()
         fp.close()
-        if link.md5_hash:
-            download_hash = _get_md5_from_file(target_file, link)
+        if link.hash and link.hash_name:
+            download_hash = _get_hash_from_file(target_file, link)
         temp_location = target_file
         logger.notify('Using download cache from %s' % target_file)
     else:
@@ -448,12 +461,11 @@ def unpack_http_url(link, location, download_cache, only_download):
                 filename += ext
         temp_location = os.path.join(temp_dir, filename)
         download_hash = _download_url(resp, link, temp_location)
-    if link.md5_hash:
-        _check_md5(download_hash, link)
-    if only_download:
-        _copy_file(temp_location, location, content_type, link)
-    else:
-        unpack_file(temp_location, location, content_type, link)
+    if link.hash and link.hash_name:
+        _check_hash(download_hash, link)
+    if download_dir:
+        _copy_file(temp_location, download_dir, content_type, link)
+    unpack_file(temp_location, location, content_type, link)
     if target_file and target_file != temp_location:
         cache_download(target_file, temp_location, content_type)
     if target_file is None:

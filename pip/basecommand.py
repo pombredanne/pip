@@ -1,6 +1,7 @@
 """Base Command class, and related routines"""
 
 import os
+from pkgutil import walk_packages
 import socket
 import sys
 import traceback
@@ -12,7 +13,9 @@ from pip.baseparser import parser, ConfigOptionParser, UpdatingDefaultsHelpForma
 from pip.download import urlopen
 from pip.exceptions import (BadCommand, InstallationError, UninstallationError,
                             CommandError)
-from pip.backwardcompat import StringIO, walk_packages
+from pip.backwardcompat import StringIO
+from pip.status_codes import SUCCESS, ERROR, UNKNOWN_ERROR, VIRTUALENV_NOT_FOUND
+
 
 __all__ = ['command_dict', 'Command', 'load_all_commands',
            'load_command', 'command_names']
@@ -47,8 +50,9 @@ class Command(object):
         # Make sure we have all global options carried over
         for attr in ['log', 'proxy', 'require_venv',
                      'log_explicit_levels', 'log_file',
-                     'timeout', 'default_vcs', 'skip_requirements_regex',
-                     'no_input']:
+                     'timeout', 'default_vcs',
+                     'skip_requirements_regex',
+                     'no_input', 'exists_action']:
             setattr(options, attr, getattr(initial_options, attr) or getattr(options, attr))
         options.quiet += initial_options.quiet
         options.verbose += initial_options.verbose
@@ -56,7 +60,7 @@ class Command(object):
     def setup_logging(self):
         pass
 
-    def main(self, complete_args, args, initial_options):
+    def main(self, args, initial_options):
         options, args = self.parser.parse_args(args)
         self.merge_options(initial_options, options)
 
@@ -73,11 +77,17 @@ class Command(object):
 
         self.setup_logging()
 
+        if options.no_input:
+            os.environ['PIP_NO_INPUT'] = '1'
+
+        if options.exists_action:
+            os.environ['PIP_EXISTS_ACTION'] = ''.join(options.exists_action)
+
         if options.require_venv:
             # If a venv is required check if it can really be found
             if not os.environ.get('VIRTUAL_ENV'):
                 logger.fatal('Could not find an activated virtualenv (required).')
-                sys.exit(3)
+                sys.exit(VIRTUALENV_NOT_FOUND)
 
         if options.log:
             log_fp = open_logfile(options.log, 'a')
@@ -89,44 +99,52 @@ class Command(object):
 
         urlopen.setup(proxystr=options.proxy, prompting=not options.no_input)
 
-        exit = 0
+        exit = SUCCESS
         store_log = False
         try:
-            self.run(options, args)
+            status = self.run(options, args)
+            # FIXME: all commands should return an exit status
+            # and when it is done, isinstance is not needed anymore
+            if isinstance(status, int):
+                exit = status
         except (InstallationError, UninstallationError):
             e = sys.exc_info()[1]
             logger.fatal(str(e))
             logger.info('Exception information:\n%s' % format_exc())
             store_log = True
-            exit = 1
+            exit = ERROR
         except BadCommand:
             e = sys.exc_info()[1]
             logger.fatal(str(e))
             logger.info('Exception information:\n%s' % format_exc())
             store_log = True
-            exit = 1
+            exit = ERROR
         except CommandError:
             e = sys.exc_info()[1]
             logger.fatal('ERROR: %s' % e)
             logger.info('Exception information:\n%s' % format_exc())
-            exit = 1
+            exit = ERROR
         except KeyboardInterrupt:
             logger.fatal('Operation cancelled by user')
             logger.info('Exception information:\n%s' % format_exc())
             store_log = True
-            exit = 1
+            exit = ERROR
         except:
             logger.fatal('Exception:\n%s' % format_exc())
             store_log = True
-            exit = 2
-
+            exit = UNKNOWN_ERROR
         if log_fp is not None:
             log_fp.close()
         if store_log:
             log_fn = options.log_file
             text = '\n'.join(complete_log)
-            logger.fatal('Storing complete log in %s' % log_fn)
-            log_fp = open_logfile(log_fn, 'w')
+            try:
+               log_fp = open_logfile(log_fn, 'w')
+            except IOError:
+               temp = tempfile.NamedTemporaryFile(delete=False)
+               log_fn = temp.name
+               log_fp = open_logfile(log_fn, 'w')
+            logger.fatal('Storing complete log in %s' % log_fn)			
             log_fp.write(text)
             log_fp.close()
         return exit

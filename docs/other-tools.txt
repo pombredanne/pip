@@ -36,9 +36,6 @@ pip doesn't do everything that easy_install does. Specifically:
   future it would be good if it could install binaries from Windows ``.exe``
   or ``.msi`` -- binary install on other platforms is not a priority.)
 
-* It doesn't understand Setuptools extras (like ``package[test]``).  This should
-  be added eventually.
-
 * It is incompatible with some packages that extensively customize distutils
   or setuptools in their ``setup.py`` files.
 
@@ -61,25 +58,6 @@ and to bail if not, use::
 
     export PIP_REQUIRE_VIRTUALENV=true
 
-
-Using pip with virtualenvwrapper
----------------------------------
-
-If you are using `virtualenvwrapper
-<http://www.doughellmann.com/projects/virtualenvwrapper/>`_, you might
-want pip to automatically create its virtualenvs in your
-``$WORKON_HOME``.
-
-You can tell pip to do so by defining ``PIP_VIRTUALENV_BASE`` in your
-environment and setting it to the same value as that of
-``$WORKON_HOME``.
-
-Do so by adding the line::
-
-    export PIP_VIRTUALENV_BASE=$WORKON_HOME
-
-in your .bashrc under the line starting with ``export WORKON_HOME``.
-
 Using pip with buildout
 -----------------------
 
@@ -87,6 +65,26 @@ If you are using `zc.buildout
 <http://pypi.python.org/pypi/zc.buildout>`_ you should look at
 `gp.recipe.pip <http://pypi.python.org/pypi/gp.recipe.pip>`_ as an
 option to use pip and virtualenv in your buildouts.
+
+Using pip with the "user scheme"
+--------------------------------
+
+With Python 2.6 came the `"user scheme" for installation
+<http://docs.python.org/install/index.html#alternate-installation-the-user-scheme>`_, which means that all
+Python distributions support an alternative install location that is specific to a user.
+The default location for each OS is explained in the python documentation
+for the `site.USER_BASE <http://docs.python.org/library/site.html#site.USER_BASE>`_ variable.
+This mode of installation can be turned on by
+specifying the ``--user`` option to ``pip install``.
+
+Moreover, the "user scheme" can be customized by setting the
+``PYTHONUSERBASE`` environment variable, which updates the value of ``site.USER_BASE``.
+
+To install "somepackage" into an environment with site.USER_BASE customized to '/myappenv', do the following::
+
+    export PYTHONUSERBASE=/myappenv
+    pip install --user somepackage
+
 
 Command line completion
 -----------------------
