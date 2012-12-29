@@ -26,8 +26,8 @@ local or remote::
 .. _setuptools extras: http://peak.telecommunity.com/DevCenter/setuptools#declaring-extras-optional-features-with-their-own-dependencies
 
 
-Edit mode
-*********
+Editable mode
+*************
 
 Packages normally_ install under ``site-packages``, but when you're
 making changes, it makes more sense to run the package straight from the
@@ -134,8 +134,37 @@ old version of the package is automatically restored if the new version
 fails to download or install.
 
 
-Searching for packages
-----------------------
+List installed packages
+--------------------------
+
+To list installed packages::
+
+    $ pip list
+
+To only list editables::
+
+    $ pip list --editable
+
+To list outdated packages (excluding editables), and the latest version available::
+
+    $ pip list --outdated
+
+To list uptodate packages (excluding editables)::
+
+    $ pip list --uptodate
+
+
+Show package status
+-------------------
+
+To get info about an installed package, including its location and included
+files::
+
+    $ pip show SomePackage
+
+
+Search for packages
+-------------------
 
 pip can search :term:`PyPI` for packages using the ``pip search``
 command::
@@ -149,6 +178,13 @@ repository.
 
 Bundles
 -------
+
+.. note::
+
+   Pip bundles are poorly supported, poorly tested, not widely used, and
+   unnecessary (the same goals can be achieved by distributing a directory of
+   sdists and using `--find-links` to reference it). The feature will likely be
+   removed in a future version of pip.
 
 Another way to distribute a set of libraries is a bundle format (specific to
 pip).  This format is not stable at this time (there simply hasn't been

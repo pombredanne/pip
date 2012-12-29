@@ -7,22 +7,18 @@ import os
 from distutils.util import strtobool
 from pip.backwardcompat import ConfigParser, string_types
 from pip.locations import default_config_file, default_log_file
+from pip.util import get_terminal_size, get_prog
 
 
-class PipPrettyHelpFormatter(optparse.IndentedHelpFormatter):
+class PrettyHelpFormatter(optparse.IndentedHelpFormatter):
     """A prettier/less verbose help formatter for optparse."""
 
-    def __init__(self, *args, **kw):
-        kw['max_help_position'] = 23
-        kw['indent_increment'] = 1
-
-        # do as argparse does
-        try:
-            kw['width'] = int(os.environ['COLUMNS']) - 2
-        except:
-            kw['width'] = 78
-
-        optparse.IndentedHelpFormatter.__init__(self, *args, **kw)
+    def __init__(self, *args, **kwargs):
+        # help position must be aligned with __init__.parseopts.description
+        kwargs['max_help_position'] = 23
+        kwargs['indent_increment'] = 1
+        kwargs['width'] = get_terminal_size()[0] - 2
+        optparse.IndentedHelpFormatter.__init__(self, *args, **kwargs)
 
     def format_option_strings(self, option):
         return self._format_option_strings(option, ' <%s>', ', ')
@@ -35,31 +31,32 @@ class PipPrettyHelpFormatter(optparse.IndentedHelpFormatter):
         :param mvarfmt: metavar format string - evaluated as mvarfmt % metavar
         :param optsep:  separator
         """
-
         opts = []
 
-        if option._short_opts: opts.append(option._short_opts[0])
-        if option._long_opts:  opts.append(option._long_opts[0])
-        if len(opts) > 1: opts.insert(1, optsep)
+        if option._short_opts:
+            opts.append(option._short_opts[0])
+        if option._long_opts:
+            opts.append(option._long_opts[0])
+        if len(opts) > 1:
+            opts.insert(1, optsep)
 
         if option.takes_value():
             metavar = option.metavar or option.dest.lower()
-            opts.append(mvarfmt % metavar)
+            opts.append(mvarfmt % metavar.upper())
 
         return ''.join(opts)
 
     def format_heading(self, heading):
-        if heading == 'Options': return ''
+        if heading == 'Options':
+            return ''
         return heading + ':\n'
 
     def format_usage(self, usage):
-        # ensure there is only one newline between usage and the first heading
-        # if there is no description
-
-        msg = 'Usage: %s' % usage
-        if self.parser.description:
-            msg += '\n'
-
+        """
+        Ensure there is only one newline between usage and the first heading
+        if there is no description.
+        """
+        msg = 'Usage: %s\n' % usage
         return msg
 
     def format_description(self, description):
@@ -77,7 +74,7 @@ class PipPrettyHelpFormatter(optparse.IndentedHelpFormatter):
             return ''
 
 
-class UpdatingDefaultsHelpFormatter(PipPrettyHelpFormatter):
+class UpdatingDefaultsHelpFormatter(PrettyHelpFormatter):
     """Custom help formatter for use in ConfigOptionParser that updates
     the defaults before expanding them, allowing them to show up correctly
     in the help listing"""
@@ -88,7 +85,27 @@ class UpdatingDefaultsHelpFormatter(PipPrettyHelpFormatter):
         return optparse.IndentedHelpFormatter.expand_default(self, option)
 
 
-class ConfigOptionParser(optparse.OptionParser):
+class CustomOptionParser(optparse.OptionParser):
+    def insert_option_group(self, idx, *args, **kwargs):
+        """Insert an OptionGroup at a given position."""
+        group = self.add_option_group(*args, **kwargs)
+
+        self.option_groups.pop()
+        self.option_groups.insert(idx, group)
+
+        return group
+
+    @property
+    def option_list_all(self):
+        """Get a list of all options, including those in option groups."""
+        res = self.option_list[:]
+        for i in self.option_groups:
+            res.extend(i.option_list)
+
+        return res
+
+
+class ConfigOptionParser(CustomOptionParser):
     """Custom option parser which updates its defaults by by checking the
     configuration files and environmental variables"""
 
@@ -148,7 +165,7 @@ class ConfigOptionParser(optparse.OptionParser):
         for key, val in items:
             key = key.replace('_', '-')
             if not key.startswith('--'):
-                key = '--%s' % key # only prefer long opts
+                key = '--%s' % key  # only prefer long opts
             normalized[key] = val
         return normalized
 
@@ -171,7 +188,7 @@ class ConfigOptionParser(optparse.OptionParser):
             # Old, pre-Optik 1.5 behaviour.
             return optparse.Values(self.defaults)
 
-        defaults = self.update_defaults(self.defaults.copy()) # ours
+        defaults = self.update_defaults(self.defaults.copy())  # ours
         for option in self._get_all_options():
             default = defaults.get(option.dest)
             if isinstance(default, string_types):
@@ -179,116 +196,153 @@ class ConfigOptionParser(optparse.OptionParser):
                 defaults[option.dest] = option.check_value(opt_str, default)
         return optparse.Values(defaults)
 
+    def error(self, msg):
+        self.print_usage(sys.stderr)
+        self.exit(2, "%s\n" % msg)
+
+
 try:
     pip_dist = pkg_resources.get_distribution('pip')
     version = '%s from %s (python %s)' % (
         pip_dist, pip_dist.location, sys.version[:3])
 except pkg_resources.DistributionNotFound:
     # when running pip.py without installing
-    version=None
+    version = None
+    
 
-parser = ConfigOptionParser(
-    usage='%prog COMMAND [OPTIONS]',
-    version=version,
-    add_help_option=False,
-    formatter=UpdatingDefaultsHelpFormatter(),
-    name='global')
+def create_main_parser():
+    parser_kw = {
+        'usage' : '%prog COMMAND [OPTIONS]',
+        'add_help_option' : False,
+        'formatter' : UpdatingDefaultsHelpFormatter(),
+        'name' : 'global',
+        'prog' : get_prog(),
+    }
 
-parser.add_option(
-    '-h', '--help',
-    dest='help',
-    action='store_true',
-    help='Show help')
-parser.add_option(
-    # Run only if inside a virtualenv, bail if not.
-    '--require-virtualenv', '--require-venv',
-    dest='require_venv',
-    action='store_true',
-    default=False,
-    help=optparse.SUPPRESS_HELP)
+    parser = ConfigOptionParser(**parser_kw)
+    genopt = optparse.OptionGroup(parser, 'General Options')
+    parser.disable_interspersed_args()
 
-parser.add_option(
-    '-v', '--verbose',
-    dest='verbose',
-    action='count',
-    default=0,
-    help='Give more output')
-parser.add_option(
-    '-q', '--quiet',
-    dest='quiet',
-    action='count',
-    default=0,
-    help='Give less output')
-parser.add_option(
-    '--log',
-    dest='log',
-    metavar='FILENAME',
-    help='Log file where a complete (maximum verbosity) record will be kept')
-parser.add_option(
-    # Writes the log levels explicitely to the log'
-    '--log-explicit-levels',
-    dest='log_explicit_levels',
-    action='store_true',
-    default=False,
-    help=optparse.SUPPRESS_HELP)
-parser.add_option(
-    # The default log file
-    '--local-log', '--log-file',
-    dest='log_file',
-    metavar='FILENAME',
-    default=default_log_file,
-    help=optparse.SUPPRESS_HELP)
-parser.add_option(
-    # Don't ask for input
-    '--no-input',
-    dest='no_input',
-    action='store_true',
-    default=False,
-    help=optparse.SUPPRESS_HELP)
+    # having a default version action just causes trouble
+    parser.version = version
 
-parser.add_option(
-    '--proxy',
-    dest='proxy',
-    type='str',
-    default='',
-    help="Specify a proxy in the form user:passwd@proxy.server:port. "
-    "Note that the user:password@ is optional and required only if you "
-    "are behind an authenticated proxy.  If you provide "
-    "user@proxy.server:port then you will be prompted for a password.")
-parser.add_option(
-    '--timeout', '--default-timeout',
-    metavar='SECONDS',
-    dest='timeout',
-    type='float',
-    default=15,
-    help='Set the socket timeout (default %default seconds)')
-parser.add_option(
-    # The default version control system for editables, e.g. 'svn'
-    '--default-vcs',
-    dest='default_vcs',
-    type='str',
-    default='',
-    help=optparse.SUPPRESS_HELP)
-parser.add_option(
-    # A regex to be used to skip requirements
-    '--skip-requirements-regex',
-    dest='skip_requirements_regex',
-    type='str',
-    default='',
-    help=optparse.SUPPRESS_HELP)
+    for opt in standard_options:
+        genopt.add_option(opt)
+    parser.add_option_group(genopt)
 
-parser.add_option(
-    # Option when path already exist
-    '--exists-action',
-    dest='exists_action',
-    type='choice',
-    choices=['s', 'i', 'w', 'b'],
-    default=[],
-    action='append',
-    help="Default action when a path already exists."
-         "Use this option more then one time to specify "
-         "another action if a certain option is not "
-         "available, choices: "
-         "(s)witch, (i)gnore, (w)ipe, (b)ackup")
+    return parser
 
-parser.disable_interspersed_args()
+
+standard_options = [
+    optparse.make_option(
+        '-h', '--help',
+        dest='help',
+        action='help',
+        help='Show help'),
+
+    optparse.make_option(
+        # Run only if inside a virtualenv, bail if not.
+        '--require-virtualenv', '--require-venv',
+        dest='require_venv',
+        action='store_true',
+        default=False,
+        help=optparse.SUPPRESS_HELP),
+
+    optparse.make_option(
+        '-v', '--verbose',
+        dest='verbose',
+        action='count',
+        default=0,
+        help='Give more output'),
+
+    optparse.make_option(
+        '-V', '--version',
+        dest='version',
+        action='store_true',
+        help='Show version and exit'),
+
+    optparse.make_option(
+        '-q', '--quiet',
+        dest='quiet',
+        action='count',
+        default=0,
+        help='Give less output'),
+
+    optparse.make_option(
+        '--log',
+        dest='log',
+        metavar='FILENAME',
+        help='Log file where a complete (maximum verbosity) record will be kept'),
+
+    optparse.make_option(
+        # Writes the log levels explicitely to the log'
+        '--log-explicit-levels',
+        dest='log_explicit_levels',
+        action='store_true',
+        default=False,
+        help=optparse.SUPPRESS_HELP),
+
+    optparse.make_option(
+        # The default log file
+        '--local-log', '--log-file',
+        dest='log_file',
+        metavar='FILENAME',
+        default=default_log_file,
+        help=optparse.SUPPRESS_HELP),
+
+    optparse.make_option(
+        # Don't ask for input
+        '--no-input',
+        dest='no_input',
+        action='store_true',
+        default=False,
+        help=optparse.SUPPRESS_HELP),
+
+    optparse.make_option(
+        '--proxy',
+        dest='proxy',
+        type='str',
+        default='',
+        help="Specify a proxy in the form user:passwd@proxy.server:port. "
+        "Note that the user:password@ is optional and required only if you "
+        "are behind an authenticated proxy. If you provide "
+        "user@proxy.server:port then you will be prompted for a password."),
+
+    optparse.make_option(
+        '--timeout', '--default-timeout',
+        metavar='SECONDS',
+        dest='timeout',
+        type='float',
+        default=15,
+        help='Set the socket timeout (default %default seconds)'),
+
+    optparse.make_option(
+        # The default version control system for editables, e.g. 'svn'
+        '--default-vcs',
+        dest='default_vcs',
+        type='str',
+        default='',
+        help=optparse.SUPPRESS_HELP),
+
+    optparse.make_option(
+        # A regex to be used to skip requirements
+        '--skip-requirements-regex',
+        dest='skip_requirements_regex',
+        type='str',
+        default='',
+        help=optparse.SUPPRESS_HELP),
+
+    optparse.make_option(
+        # Option when path already exist
+        '--exists-action',
+        dest='exists_action',
+        type='choice',
+        choices=['s', 'i', 'w', 'b'],
+        default=[],
+        action='append',
+        help="Default action when a path already exists. "
+             "Use this option more than one time to specify "
+             "another action if a certain option is not "
+             "available. Choices: "
+             "(s)witch, (i)gnore, (w)ipe, (b)ackup"),
+    ]

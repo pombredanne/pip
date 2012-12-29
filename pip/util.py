@@ -20,9 +20,18 @@ __all__ = ['rmtree', 'display_path', 'backup_dir',
            'is_svn_page', 'file_contents',
            'split_leading_dir', 'has_leading_dir',
            'make_path_relative', 'normalize_path',
-           'renames', 'get_terminal_size',
+           'renames', 'get_terminal_size', 'get_prog',
            'unzip_file', 'untar_file', 'create_download_cache_folder',
            'cache_download', 'unpack_file', 'call_subprocess']
+
+
+def get_prog():
+    try:
+        if os.path.basename(sys.argv[0]) in ('__main__.py', '-c'):
+            return "%s -m pip" % sys.executable
+    except (AttributeError, TypeError, IndexError):
+        pass
+    return 'pip'
 
 
 def rmtree(dir, ignore_errors=False):
@@ -78,7 +87,7 @@ def find_command(cmd, paths=None, pathext=None):
     # check if there are funny path extensions for executables, e.g. Windows
     if pathext is None:
         pathext = get_pathext()
-    pathext = [ext for ext in pathext.lower().split(os.pathsep)]
+    pathext = [ext for ext in pathext.lower().split(os.pathsep) if len(ext)]
     # don't use extensions if the command ends with one of them
     if os.path.splitext(cmd)[1].lower() in pathext:
         pathext = ['']
@@ -127,15 +136,33 @@ def ask(message, options):
 
 class _Inf(object):
     """I am bigger than everything!"""
-    def __cmp__(self, a):
-        if self is a:
-            return 0
-        return 1
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        else:
+            return False
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __lt__(self, other):
+        return False
+
+    def __le__(self, other):
+        return False
+
+    def __gt__(self, other):
+        return True
+
+    def __ge__(self, other):
+        return True
 
     def __repr__(self):
         return 'Inf'
 
-Inf = _Inf()
+
+Inf = _Inf() #this object is not currently used as a sortable in our code
 del _Inf
 
 
@@ -172,7 +199,6 @@ def is_svn_page(html):
     return (re.search(r'<title>[^<]*Revision \d+:', html)
             and re.search(r'Powered by (?:<a[^>]*?>)?Subversion', html, re.I))
 
-is_pypy = hasattr(sys, 'pypy_version_info')
 
 def file_contents(filename):
     fp = open(filename, 'rb')
@@ -311,7 +337,17 @@ def dist_in_site_packages(dist):
     return normalize_path(dist_location(dist)).startswith(normalize_path(site_packages))
 
 
-def get_installed_distributions(local_only=True, skip=('setuptools', 'pip', 'python')):
+def dist_is_editable(dist):
+    """Is distribution an editable install?"""
+    #TODO: factor out determining editableness out of FrozenRequirement
+    from pip import FrozenRequirement
+    req = FrozenRequirement.from_dist(dist, [])
+    return req.editable
+
+def get_installed_distributions(local_only=True,
+                                skip=('setuptools', 'pip', 'python'),
+                                include_editables=True,
+                                editables_only=False):
     """
     Return a list of installed Distribution objects.
 
@@ -322,12 +358,32 @@ def get_installed_distributions(local_only=True, skip=('setuptools', 'pip', 'pyt
     ignore; defaults to ('setuptools', 'pip', 'python'). [FIXME also
     skip virtualenv?]
 
+    If ``editables`` is False, don't report editables.
+
+    If ``editables_only`` is True , only report editables.
+
     """
     if local_only:
         local_test = dist_is_local
     else:
         local_test = lambda d: True
-    return [d for d in pkg_resources.working_set if local_test(d) and d.key not in skip]
+
+    if include_editables:
+        editable_test = lambda d: True
+    else:
+        editable_test = lambda d: not dist_is_editable(d)
+
+    if editables_only:
+        editables_only_test = lambda d: dist_is_editable(d)
+    else:
+        editables_only_test = lambda d: True
+
+    return [d for d in pkg_resources.working_set
+            if local_test(d)
+            and d.key not in skip
+            and editable_test(d)
+            and editables_only_test(d)
+            ]
 
 
 def egg_link_path(dist):
@@ -345,8 +401,7 @@ def egg_link_path(dist):
     For #1 and #3, there could be odd cases, where there's an egg-link in 2 locations.
     This method will just return the first one found.
     """
-
-    sites=[]
+    sites = []
     if running_under_virtualenv():
         if virtualenv_no_global():
             sites.append(site_packages)
