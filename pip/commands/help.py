@@ -1,11 +1,13 @@
-from pip.basecommand import Command, SUCCESS, ERROR
+from pip.basecommand import Command, SUCCESS
 from pip.exceptions import CommandError
 
 
 class HelpCommand(Command):
+    """Show help for commands"""
     name = 'help'
-    usage = '%prog'
-    summary = 'Show available commands'
+    usage = """
+      %prog <command>"""
+    summary = 'Show help for commands.'
 
     def run(self, options, args):
         from pip.commands import commands, get_similar_commands
@@ -25,7 +27,7 @@ class HelpCommand(Command):
 
             raise CommandError(' - '.join(msg))
 
-        command = commands[cmd_name](self.main_parser)  # instantiate
+        command = commands[cmd_name]()
         command.parser.print_help()
 
         return SUCCESS

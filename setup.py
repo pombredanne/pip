@@ -2,11 +2,32 @@ import codecs
 import os
 import re
 import sys
-from setuptools import setup
+
+from setuptools import setup, find_packages
+from setuptools.command.test import test as TestCommand
+
+here = os.path.abspath(os.path.dirname(__file__))
+
+
+class PyTest(TestCommand):
+
+    def finalize_options(self):
+        TestCommand.finalize_options(self)
+
+        self.test_args = []
+        self.test_suite = True
+
+    def run_tests(self):
+        # import here, cause outside the eggs aren't loaded
+        import pytest
+
+        sys.exit(pytest.main(self.test_args))
 
 
 def read(*parts):
-    return codecs.open(os.path.join(os.path.abspath(os.path.dirname(__file__)), *parts), 'r').read()
+    # intentionally *not* adding an encoding option to open, See:
+    #   https://github.com/pypa/virtualenv/issues/201#issuecomment-3145690
+    return codecs.open(os.path.join(here, *parts), 'r').read()
 
 
 def find_version(*file_paths):
@@ -17,49 +38,51 @@ def find_version(*file_paths):
         return version_match.group(1)
     raise RuntimeError("Unable to find version string.")
 
-long_description = """
+long_description = read('README.rst')
 
-The main website for pip is `www.pip-installer.org
-<http://www.pip-installer.org>`_. You can also install
-the `in-development version <https://github.com/pypa/pip/tarball/develop#egg=pip-dev>`_
-of pip with ``easy_install pip==dev``.
+tests_require = ['pytest', 'virtualenv>=1.10', 'scripttest>=1.3', 'mock']
 
-"""
-# remove the toctree from sphinx index, as it breaks long_description
-parts = read("docs", "index.txt").split("split here", 2)
-long_description = (parts[0] + long_description + parts[2] +
-                    "\n\n" + read("docs", "news.txt"))
-
-tests_require = ['nose', 'virtualenv>=1.7', 'scripttest>=1.1.1', 'mock']
-
-setup(name="pip",
-      version=find_version('pip', '__init__.py'),
-      description="pip installs packages. Python packages. An easy_install replacement",
-      long_description=long_description,
-      classifiers=[
-        'Development Status :: 5 - Production/Stable',
-        'Intended Audience :: Developers',
-        'License :: OSI Approved :: MIT License',
-        'Topic :: Software Development :: Build Tools',
-        'Programming Language :: Python :: 2',
-        'Programming Language :: Python :: 2.5',
-        'Programming Language :: Python :: 2.6',
-        'Programming Language :: Python :: 2.7',
-        'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.1',
-        'Programming Language :: Python :: 3.2',
-      ],
-      keywords='easy_install distutils setuptools egg virtualenv',
-      author='The pip developers',
-      author_email='python-virtualenv@groups.google.com',
-      url='http://www.pip-installer.org',
-      license='MIT',
-      packages=['pip', 'pip.commands', 'pip.vcs'],
-      entry_points=dict(console_scripts=['pip=pip:main', 'pip-%s=pip:main' % sys.version[:3]]),
-      test_suite='nose.collector',
-      tests_require=tests_require,
-      zip_safe=False,
-      extras_require = {
-          'testing':tests_require,
-          },
-      )
+setup(
+    name="pip",
+    version=find_version("pip", "__init__.py"),
+    description="The PyPA recommended tool for installing Python packages.",
+    long_description=long_description,
+    classifiers=[
+        "Development Status :: 5 - Production/Stable",
+        "Intended Audience :: Developers",
+        "License :: OSI Approved :: MIT License",
+        "Topic :: Software Development :: Build Tools",
+        "Programming Language :: Python :: 2",
+        "Programming Language :: Python :: 2.6",
+        "Programming Language :: Python :: 2.7",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.2",
+        "Programming Language :: Python :: 3.3",
+        "Programming Language :: Python :: 3.4",
+        "Programming Language :: Python :: Implementation :: PyPy"
+    ],
+    keywords='easy_install distutils setuptools egg virtualenv',
+    author='The pip developers',
+    author_email='python-virtualenv@groups.google.com',
+    url='https://pip.pypa.io/',
+    license='MIT',
+    packages=find_packages(exclude=["contrib", "docs", "tests*", "tasks"]),
+    package_data={
+        'pip._vendor.requests': ['*.pem'],
+        'pip._vendor.distlib._backport': ['sysconfig.cfg'],
+        'pip._vendor.distlib': ['t32.exe', 't64.exe', 'w32.exe', 'w64.exe'],
+    },
+    entry_points={
+        "console_scripts": [
+            "pip=pip:main",
+            "pip%s=pip:main" % sys.version[:1],
+            "pip%s=pip:main" % sys.version[:3],
+        ],
+    },
+    tests_require=tests_require,
+    zip_safe=False,
+    extras_require={
+        'testing': tests_require,
+    },
+    cmdclass={'test': PyTest},
+)

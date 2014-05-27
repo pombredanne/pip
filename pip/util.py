@@ -1,17 +1,25 @@
-import sys
-import shutil
-import os
-import stat
+import locale
 import re
+import os
 import posixpath
-import pkg_resources
-import zipfile
-import tarfile
+import shutil
+import stat
 import subprocess
+import sys
+import tarfile
+import zipfile
+
 from pip.exceptions import InstallationError, BadCommand
-from pip.backwardcompat import WindowsError, string_types, raw_input, console_to_str, user_site
-from pip.locations import site_packages, running_under_virtualenv, virtualenv_no_global
+from pip.compat import(
+    string_types, raw_input, console_to_str, stdlib_pkgs
+)
+from pip.locations import (
+    site_packages, user_site, running_under_virtualenv, virtualenv_no_global,
+    write_delete_marker_file
+)
 from pip.log import logger
+from pip._vendor import pkg_resources
+from pip._vendor.distlib import version
 
 __all__ = ['rmtree', 'display_path', 'backup_dir',
            'find_command', 'ask', 'Inf',
@@ -21,8 +29,7 @@ __all__ = ['rmtree', 'display_path', 'backup_dir',
            'split_leading_dir', 'has_leading_dir',
            'make_path_relative', 'normalize_path',
            'renames', 'get_terminal_size', 'get_prog',
-           'unzip_file', 'untar_file', 'create_download_cache_folder',
-           'cache_download', 'unpack_file', 'call_subprocess']
+           'unzip_file', 'untar_file', 'unpack_file', 'call_subprocess']
 
 
 def get_prog():
@@ -43,19 +50,15 @@ def rmtree_errorhandler(func, path, exc_info):
     """On Windows, the files in .svn are read-only, so when rmtree() tries to
     remove them, an exception is thrown.  We catch that here, remove the
     read-only attribute, and hopefully continue without problems."""
-    exctype, value = exc_info[:2]
-    # On Python 2.4, it will be OSError number 13
-    # On all more recent Pythons, it'll be WindowsError number 5
-    if not ((exctype is WindowsError and value.args[0] == 5) or
-            (exctype is OSError and value.args[0] == 13)):
+    # if file type currently read only
+    if os.stat(path).st_mode & stat.S_IREAD:
+        # convert to read/write
+        os.chmod(path, stat.S_IWRITE)
+        # use the original function to repeat the operation
+        func(path)
+        return
+    else:
         raise
-    # file type should currently be read only
-    if ((os.stat(path).st_mode & stat.S_IREAD) != stat.S_IREAD):
-        raise
-    # convert to read/write
-    os.chmod(path, stat.S_IWRITE)
-    # use the original function to repeat the operation
-    func(path)
 
 
 def display_path(path):
@@ -114,7 +117,7 @@ def get_pathext(default_pathext=None):
 
 
 def ask_path_exists(message, options):
-    for action in os.environ.get('PIP_EXISTS_ACTION', ''):
+    for action in os.environ.get('PIP_EXISTS_ACTION', '').split():
         if action in options:
             return action
     return ask(message, options)
@@ -124,12 +127,17 @@ def ask(message, options):
     """Ask the message interactively, with the given possible responses"""
     while 1:
         if os.environ.get('PIP_NO_INPUT'):
-            raise Exception('No input was expected ($PIP_NO_INPUT set); question: %s' % message)
+            raise Exception(
+                'No input was expected ($PIP_NO_INPUT set); question: %s' %
+                message
+            )
         response = raw_input(message)
         response = response.strip().lower()
         if response not in options:
-            print('Your response (%r) was not one of the expected responses: %s' % (
-                response, ', '.join(options)))
+            print(
+                'Your response (%r) was not one of the expected responses: '
+                '%s' % (response, ', '.join(options))
+            )
         else:
             return response
 
@@ -162,7 +170,7 @@ class _Inf(object):
         return 'Inf'
 
 
-Inf = _Inf() #this object is not currently used as a sortable in our code
+Inf = _Inf()  # this object is not currently used as a sortable in our code
 del _Inf
 
 
@@ -174,12 +182,12 @@ def normalize_name(name):
 
 
 def format_size(bytes):
-    if bytes > 1000*1000:
-        return '%.1fMB' % (bytes/1000.0/1000)
-    elif bytes > 10*1000:
-        return '%ikB' % (bytes/1000)
+    if bytes > 1000 * 1000:
+        return '%.1fMB' % (bytes / 1000.0 / 1000)
+    elif bytes > 10 * 1000:
+        return '%ikB' % (bytes / 1000)
     elif bytes > 1000:
-        return '%.1fkB' % (bytes/1000.0)
+        return '%.1fkB' % (bytes / 1000.0)
     else:
         return '%ibytes' % bytes
 
@@ -195,7 +203,9 @@ def is_installable_dir(path):
 
 
 def is_svn_page(html):
-    """Returns true if the page appears to be the index page of an svn repository"""
+    """
+    Returns true if the page appears to be the index page of an svn repository
+    """
     return (re.search(r'<title>[^<]*Revision \d+:', html)
             and re.search(r'Powered by (?:<a[^>]*?>)?Subversion', html, re.I))
 
@@ -240,13 +250,13 @@ def make_path_relative(path, rel_to):
     Make a filename relative, where the filename path, and it is
     relative to rel_to
 
-        >>> make_relative_path('/usr/share/something/a-file.pth',
+        >>> make_path_relative('/usr/share/something/a-file.pth',
         ...                    '/usr/share/another-place/src/Directory')
         '../../../something/a-file.pth'
-        >>> make_relative_path('/usr/share/something/a-file.pth',
+        >>> make_path_relative('/usr/share/something/a-file.pth',
         ...                    '/home/user/src/Directory')
         '../../../usr/share/something/a-file.pth'
-        >>> make_relative_path('/usr/share/a-file.pth', '/usr/share/')
+        >>> make_path_relative('/usr/share/a-file.pth', '/usr/share/')
         'a-file.pth'
     """
     path_filename = os.path.basename(path)
@@ -258,7 +268,7 @@ def make_path_relative(path, rel_to):
     while path_parts and rel_to_parts and path_parts[0] == rel_to_parts[0]:
         path_parts.pop(0)
         rel_to_parts.pop(0)
-    full_parts = ['..']*len(rel_to_parts) + path_parts + [path_filename]
+    full_parts = ['..'] * len(rel_to_parts) + path_parts + [path_filename]
     if full_parts == ['']:
         return '.' + os.path.sep
     return os.path.sep.join(full_parts)
@@ -269,7 +279,7 @@ def normalize_path(path):
     Convert a path to its canonical, case-normalized, absolute version.
 
     """
-    return os.path.normcase(os.path.realpath(path))
+    return os.path.normcase(os.path.realpath(os.path.expanduser(path)))
 
 
 def splitext(path):
@@ -325,27 +335,30 @@ def dist_in_usersite(dist):
     """
     Return True if given Distribution is installed in user site.
     """
-    if user_site:
-        return normalize_path(dist_location(dist)).startswith(normalize_path(user_site))
-    else:
-        return False
+    norm_path = normalize_path(dist_location(dist))
+    return norm_path.startswith(normalize_path(user_site))
+
 
 def dist_in_site_packages(dist):
     """
-    Return True if given Distribution is installed in distutils.sysconfig.get_python_lib().
+    Return True if given Distribution is installed in
+    distutils.sysconfig.get_python_lib().
     """
-    return normalize_path(dist_location(dist)).startswith(normalize_path(site_packages))
+    return normalize_path(
+        dist_location(dist)
+    ).startswith(normalize_path(site_packages))
 
 
 def dist_is_editable(dist):
     """Is distribution an editable install?"""
-    #TODO: factor out determining editableness out of FrozenRequirement
+    # TODO: factor out determining editableness out of FrozenRequirement
     from pip import FrozenRequirement
     req = FrozenRequirement.from_dist(dist, [])
     return req.editable
 
+
 def get_installed_distributions(local_only=True,
-                                skip=('setuptools', 'pip', 'python'),
+                                skip=stdlib_pkgs,
                                 include_editables=True,
                                 editables_only=False):
     """
@@ -355,8 +368,7 @@ def get_installed_distributions(local_only=True,
     local to the current virtualenv, if in a virtualenv.
 
     ``skip`` argument is an iterable of lower-case project names to
-    ignore; defaults to ('setuptools', 'pip', 'python'). [FIXME also
-    skip virtualenv?]
+    ignore; defaults to stdlib_pkgs
 
     If ``editables`` is False, don't report editables.
 
@@ -396,9 +408,12 @@ def egg_link_path(dist):
     2) in a no-global virtualenv
        try to find in site_packages
     3) in a yes-global virtualenv
-       try to find in site_packages, then site.USER_SITE  (don't look in global location)
+       try to find in site_packages, then site.USER_SITE
+       (don't look in global location)
 
-    For #1 and #3, there could be odd cases, where there's an egg-link in 2 locations.
+    For #1 and #3, there could be odd cases, where there's an egg-link in 2
+    locations.
+
     This method will just return the first one found.
     """
     sites = []
@@ -442,8 +457,10 @@ def get_terminal_size():
             import fcntl
             import termios
             import struct
-            cr = struct.unpack('hh', fcntl.ioctl(fd, termios.TIOCGWINSZ,
-        '1234'))
+            cr = struct.unpack(
+                'hh',
+                fcntl.ioctl(fd, termios.TIOCGWINSZ, '1234')
+            )
         except:
             return None
         if cr == (0, 0):
@@ -464,16 +481,30 @@ def get_terminal_size():
     return int(cr[1]), int(cr[0])
 
 
+def current_umask():
+    """Get the current umask which involves having to set it temporarily."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
 def unzip_file(filename, location, flatten=True):
-    """Unzip the file (zip file located at filename) to the destination
-    location"""
+    """
+    Unzip the file (with path `filename`) to the destination `location`.  All
+    files are written based on system defaults and umask (i.e. permissions are
+    not preserved), except that regular file members with any execute
+    permissions (user, group, or world) have "chmod +x" applied after being
+    written. Note that for windows, any execute changes using os.chmod are
+    no-ops per the python docs.
+    """
     if not os.path.exists(location):
         os.makedirs(location)
     zipfp = open(filename, 'rb')
     try:
         zip = zipfile.ZipFile(zipfp)
         leading = has_leading_dir(zip.namelist()) and flatten
-        for name in zip.namelist():
+        for info in zip.infolist():
+            name = info.filename
             data = zip.read(name)
             fn = name
             if leading:
@@ -492,17 +523,32 @@ def unzip_file(filename, location, flatten=True):
                     fp.write(data)
                 finally:
                     fp.close()
+                    mode = info.external_attr >> 16
+                    # if mode and regular file and any execute permissions for
+                    # user/group/world?
+                    if mode and stat.S_ISREG(mode) and mode & 0o111:
+                        # make dest file have execute for user/group/world
+                        # (chmod +x) no-op on windows per python docs
+                        os.chmod(fn, (0o777 - current_umask() | 0o111))
     finally:
         zipfp.close()
 
 
 def untar_file(filename, location):
-    """Untar the file (tar file located at filename) to the destination location"""
+    """
+    Untar the file (with path `filename`) to the destination `location`.
+    All files are written based on system defaults and umask (i.e. permissions
+    are not preserved), except that regular file members with any execute
+    permissions (user, group, or world) have "chmod +x" applied after being
+    written.  Note that for windows, any execute changes using os.chmod are
+    no-ops per the python docs.
+    """
     if not os.path.exists(location):
         os.makedirs(location)
     if filename.lower().endswith('.gz') or filename.lower().endswith('.tgz'):
         mode = 'r:gz'
-    elif filename.lower().endswith('.bz2') or filename.lower().endswith('.tbz'):
+    elif (filename.lower().endswith('.bz2')
+            or filename.lower().endswith('.tbz')):
         mode = 'r:bz2'
     elif filename.lower().endswith('.tar'):
         mode = 'r'
@@ -511,7 +557,7 @@ def untar_file(filename, location):
         mode = 'r:*'
     tar = tarfile.open(filename, mode)
     try:
-        # note: python<=2.5 doesnt seem to know about pax headers, filter them
+        # note: python<=2.5 doesn't seem to know about pax headers, filter them
         leading = has_leading_dir([
             member.name for member in tar.getmembers()
             if member.name != 'pax_global_header'
@@ -529,24 +575,22 @@ def untar_file(filename, location):
             elif member.issym():
                 try:
                     tar._extract_member(member, path)
-                except:
-                    e = sys.exc_info()[1]
+                except Exception as exc:
                     # Some corrupt tar files seem to produce this
                     # (specifically bad symlinks)
                     logger.warn(
                         'In the tar file %s the member %s is invalid: %s'
-                        % (filename, member.name, e))
+                        % (filename, member.name, exc))
                     continue
             else:
                 try:
                     fp = tar.extractfile(member)
-                except (KeyError, AttributeError):
-                    e = sys.exc_info()[1]
+                except (KeyError, AttributeError) as exc:
                     # Some corrupt tar files seem to produce this
                     # (specifically bad symlinks)
                     logger.warn(
                         'In the tar file %s the member %s is invalid: %s'
-                        % (filename, member.name, e))
+                        % (filename, member.name, exc))
                     continue
                 if not os.path.exists(os.path.dirname(path)):
                     os.makedirs(os.path.dirname(path))
@@ -556,47 +600,47 @@ def untar_file(filename, location):
                 finally:
                     destfp.close()
                 fp.close()
+                # member have any execute permissions for user/group/world?
+                if member.mode & 0o111:
+                    # make dest file have execute for user/group/world
+                    # no-op on windows per python docs
+                    os.chmod(path, (0o777 - current_umask() | 0o111))
     finally:
         tar.close()
 
 
-def create_download_cache_folder(folder):
-    logger.indent -= 2
-    logger.notify('Creating supposed download cache at %s' % folder)
-    logger.indent += 2
-    os.makedirs(folder)
-
-
-def cache_download(target_file, temp_location, content_type):
-    logger.notify('Storing download in cache at %s' % display_path(target_file))
-    shutil.copyfile(temp_location, target_file)
-    fp = open(target_file+'.content-type', 'w')
-    fp.write(content_type)
-    fp.close()
-    os.unlink(temp_location)
-
-
 def unpack_file(filename, location, content_type, link):
+    filename = os.path.realpath(filename)
     if (content_type == 'application/zip'
-        or filename.endswith('.zip')
-        or filename.endswith('.pybundle')
-        or zipfile.is_zipfile(filename)):
-        unzip_file(filename, location, flatten=not filename.endswith('.pybundle'))
+            or filename.endswith('.zip')
+            or filename.endswith('.whl')
+            or zipfile.is_zipfile(filename)):
+        unzip_file(
+            filename,
+            location,
+            flatten=not filename.endswith('.whl')
+        )
     elif (content_type == 'application/x-gzip'
-          or tarfile.is_tarfile(filename)
-          or splitext(filename)[1].lower() in ('.tar', '.tar.gz', '.tar.bz2', '.tgz', '.tbz')):
+            or tarfile.is_tarfile(filename)
+            or splitext(filename)[1].lower() in (
+                '.tar', '.tar.gz', '.tar.bz2', '.tgz', '.tbz')):
         untar_file(filename, location)
     elif (content_type and content_type.startswith('text/html')
-          and is_svn_page(file_contents(filename))):
+            and is_svn_page(file_contents(filename))):
         # We don't really care about this
         from pip.vcs.subversion import Subversion
         Subversion('svn+' + link.url).unpack(location)
     else:
-        ## FIXME: handle?
-        ## FIXME: magic signatures?
-        logger.fatal('Cannot unpack file %s (downloaded from %s, content-type: %s); cannot detect archive format'
-                     % (filename, location, content_type))
-        raise InstallationError('Cannot determine archive format of %s' % location)
+        # FIXME: handle?
+        # FIXME: magic signatures?
+        logger.fatal(
+            'Cannot unpack file %s (downloaded from %s, content-type: %s); '
+            'cannot detect archive format' %
+            (filename, location, content_type)
+        )
+        raise InstallationError(
+            'Cannot determine archive format of %s' % location
+        )
 
 
 def call_subprocess(cmd, show_stdout=True,
@@ -623,10 +667,9 @@ def call_subprocess(cmd, show_stdout=True,
         proc = subprocess.Popen(
             cmd, stderr=subprocess.STDOUT, stdin=None, stdout=stdout,
             cwd=cwd, env=env)
-    except Exception:
-        e = sys.exc_info()[1]
+    except Exception as exc:
         logger.fatal(
-            "Error %s while executing command %s" % (e, command_desc))
+            "Error %s while executing command %s" % (exc, command_desc))
         raise
     all_output = []
     if stdout is not None:
@@ -653,14 +696,87 @@ def call_subprocess(cmd, show_stdout=True,
     if proc.returncode:
         if raise_on_returncode:
             if all_output:
-                logger.notify('Complete output from command %s:' % command_desc)
-                logger.notify('\n'.join(all_output) + '\n----------------------------------------')
+                logger.notify(
+                    'Complete output from command %s:' % command_desc
+                )
+                logger.notify(
+                    '\n'.join(all_output) +
+                    '\n----------------------------------------'
+                )
             raise InstallationError(
-                "Command %s failed with error code %s in %s"
+                'Command "%s" failed with error code %s in %s'
                 % (command_desc, proc.returncode, cwd))
         else:
             logger.warn(
-                "Command %s had error code %s in %s"
+                'Command "%s" had error code %s in %s'
                 % (command_desc, proc.returncode, cwd))
     if stdout is not None:
         return ''.join(all_output)
+
+
+def is_prerelease(vers):
+    """
+    Attempt to determine if this is a pre-release using PEP386/PEP426 rules.
+
+    Will return True if it is a pre-release and False if not. Versions are
+    assumed to be a pre-release if they cannot be parsed.
+    """
+    normalized = version._suggest_normalized_version(vers)
+
+    if normalized is None:
+        # Cannot normalize, assume it is a pre-release
+        return True
+
+    parsed = version._normalized_key(normalized)
+    return any([
+        any([y in set(["a", "b", "c", "rc", "dev"]) for y in x])
+        for x in parsed
+    ])
+
+
+def read_text_file(filename):
+    """Return the contents of *filename*.
+
+    Try to decode the file contents with utf-8, the preferred system encoding
+    (e.g., cp1252 on some Windows machines), and latin1, in that order.
+    Decoding a byte string with latin1 will never raise an error. In the worst
+    case, the returned string will contain some garbage characters.
+
+    """
+    with open(filename, 'rb') as fp:
+        data = fp.read()
+
+    encodings = ['utf-8', locale.getpreferredencoding(False), 'latin1']
+    for enc in encodings:
+        try:
+            data = data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        break
+
+    assert type(data) != bytes  # Latin1 should have worked.
+    return data
+
+
+def _make_build_dir(build_dir):
+    os.makedirs(build_dir)
+    write_delete_marker_file(build_dir)
+
+
+class FakeFile(object):
+    """Wrap a list of lines in an object with readline() to make
+    ConfigParser happy."""
+    def __init__(self, lines):
+        self._gen = (l for l in lines)
+
+    def readline(self):
+        try:
+            try:
+                return next(self._gen)
+            except NameError:
+                return self._gen.next()
+        except StopIteration:
+            return ''
+
+    def __iter__(self):
+        return self._gen

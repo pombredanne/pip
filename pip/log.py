@@ -2,27 +2,77 @@
 """
 
 import sys
+import os
 import logging
 
-import pip.backwardcompat
+from pip._vendor import colorama, pkg_resources
+
+
+def _color_wrap(*colors):
+    def wrapped(inp):
+        return "".join(list(colors) + [inp, colorama.Style.RESET_ALL])
+    return wrapped
+
+
+def should_color(consumer, environ, std=(sys.stdout, sys.stderr)):
+    real_consumer = (
+        consumer if not isinstance(consumer, colorama.AnsiToWin32)
+        else consumer.wrapped
+    )
+
+    # If consumer isn't stdout or stderr we shouldn't colorize it
+    if real_consumer not in std:
+        return False
+
+    # If consumer is a tty we should color it
+    if hasattr(real_consumer, "isatty") and real_consumer.isatty():
+        return True
+
+    # If we have an ASNI term we should color it
+    if environ.get("TERM") == "ANSI":
+        return True
+
+    # If anything else we should not color it
+    return False
+
+
+def should_warn(current_version, removal_version):
+    # Our Significant digits on versions is 2, so remove everything but the
+    #   first two places.
+    current_version = ".".join(current_version.split(".")[:2])
+    removal_version = ".".join(removal_version.split(".")[:2])
+
+    # Our warning threshold is one minor version before removal, so we
+    #   decrement the minor version by one
+    major, minor = removal_version.split(".")
+    minor = str(int(minor) - 1)
+    warn_version = ".".join([major, minor])
+
+    # Test if our current_version should be a warn
+    return (pkg_resources.parse_version(current_version)
+            < pkg_resources.parse_version(warn_version))
 
 
 class Logger(object):
-
     """
     Logging object for use in command-line script.  Allows ranges of
     levels, to avoid some redundancy of displayed information.
     """
-
-    VERBOSE_DEBUG = logging.DEBUG-1
+    VERBOSE_DEBUG = logging.DEBUG - 1
     DEBUG = logging.DEBUG
     INFO = logging.INFO
-    NOTIFY = (logging.INFO+logging.WARN)/2
+    NOTIFY = (logging.INFO + logging.WARN) / 2
     WARN = WARNING = logging.WARN
     ERROR = logging.ERROR
     FATAL = logging.FATAL
 
     LEVELS = [VERBOSE_DEBUG, DEBUG, INFO, NOTIFY, WARN, ERROR, FATAL]
+
+    COLORS = {
+        WARN: _color_wrap(colorama.Fore.YELLOW),
+        ERROR: _color_wrap(colorama.Fore.RED),
+        FATAL: _color_wrap(colorama.Fore.RED),
+    }
 
     def __init__(self):
         self.consumers = []
@@ -30,6 +80,25 @@ class Logger(object):
         self.explicit_levels = False
         self.in_progress = None
         self.in_progress_hanging = False
+
+    def add_consumers(self, *consumers):
+        for level, consumer in consumers:
+            # Try to check for duplicate consumers before adding them
+            for chk_level, chk_consumer in self.consumers:
+                # Account for coloroma wrapped streams
+                if isinstance(chk_consumer, colorama.AnsiToWin32):
+                    chk_consumer = chk_consumer.wrapped
+
+                if (level, consumer) == (chk_level, chk_consumer):
+                    break
+            # If we didn't find a duplicate, then add it
+            else:
+                # Colorize consumer for Windows
+                if sys.platform.startswith('win') \
+                   and hasattr(consumer, 'write'):
+                    consumer = colorama.AnsiToWin32(consumer)
+
+                self.consumers.append((level, consumer))
 
     def debug(self, msg, *args, **kw):
         self.log(self.DEBUG, msg, *args, **kw)
@@ -44,10 +113,27 @@ class Logger(object):
         self.log(self.WARN, msg, *args, **kw)
 
     def error(self, msg, *args, **kw):
-        self.log(self.WARN, msg, *args, **kw)
+        self.log(self.ERROR, msg, *args, **kw)
 
     def fatal(self, msg, *args, **kw):
         self.log(self.FATAL, msg, *args, **kw)
+
+    def deprecated(self, removal_version, msg, *args, **kwargs):
+        """
+        Logs deprecation message which is log level WARN if the
+        ``removal_version`` is > 1 minor release away and log level ERROR
+        otherwise.
+
+        removal_version should be the version that the deprecated feature is
+        expected to be removed in, so something that will not exist in
+        version 1.7, but will in 1.6 would have a removal_version of 1.7.
+        """
+        from pip import __version__
+
+        if should_warn(__version__, removal_version):
+            self.warn(msg, *args, **kwargs)
+        else:
+            self.error(msg, *args, **kwargs)
 
     def log(self, level, msg, *args, **kw):
         if args:
@@ -55,26 +141,35 @@ class Logger(object):
                 raise TypeError(
                     "You may give positional or keyword arguments, not both")
         args = args or kw
-        rendered = None
+
+        # render
+        if args:
+            rendered = msg % args
+        else:
+            rendered = msg
+        rendered = ' ' * self.indent + rendered
+        if self.explicit_levels:
+            # FIXME: should this be a name, not a level number?
+            rendered = '%02i %s' % (level, rendered)
+
         for consumer_level, consumer in self.consumers:
             if self.level_matches(level, consumer_level):
                 if (self.in_progress_hanging
-                    and consumer in (sys.stdout, sys.stderr)):
+                        and consumer in (sys.stdout, sys.stderr)):
                     self.in_progress_hanging = False
                     sys.stdout.write('\n')
                     sys.stdout.flush()
-                if rendered is None:
-                    if args:
-                        rendered = msg % args
-                    else:
-                        rendered = msg
-                    rendered = ' '*self.indent + rendered
-                    if self.explicit_levels:
-                        ## FIXME: should this be a name, not a level number?
-                        rendered = '%02i %s' % (level, rendered)
                 if hasattr(consumer, 'write'):
-                    rendered += '\n'
-                    pip.backwardcompat.fwrite(consumer, rendered)
+                    write_content = rendered + '\n'
+                    if should_color(consumer, os.environ):
+                        # We are printing to stdout or stderr and it supports
+                        #   colors so render our text colored
+                        colorizer = self.COLORS.get(level, lambda x: x)
+                        write_content = colorizer(write_content)
+
+                    consumer.write(write_content)
+                    if hasattr(consumer, 'flush'):
+                        consumer.flush()
                 else:
                     consumer(rendered)
 
@@ -87,7 +182,7 @@ class Logger(object):
             "Tried to start_progress(%r) while in_progress %r"
             % (msg, self.in_progress))
         if self._show_progress():
-            sys.stdout.write(' '*self.indent + msg)
+            sys.stdout.write(' ' * self.indent + msg)
             sys.stdout.flush()
             self.in_progress_hanging = True
         else:
@@ -104,7 +199,8 @@ class Logger(object):
                 sys.stdout.write('...' + self.in_progress + msg + '\n')
                 sys.stdout.flush()
             else:
-                # These erase any messages shown with show_progress (besides .'s)
+                # These erase any messages shown with show_progress
+                # (besides .'s)
                 logger.show_progress('')
                 logger.show_progress('')
                 sys.stdout.write(msg + '\n')
@@ -121,10 +217,16 @@ class Logger(object):
                 sys.stdout.flush()
             else:
                 if self.last_message:
-                    padding = ' ' * max(0, len(self.last_message)-len(message))
+                    padding = ' ' * max(
+                        0,
+                        len(self.last_message) - len(message)
+                    )
                 else:
                     padding = ''
-                sys.stdout.write('\r%s%s%s%s' % (' '*self.indent, self.in_progress, message, padding))
+                sys.stdout.write(
+                    '\r%s%s%s%s' %
+                    (' ' * self.indent, self.in_progress, message, padding)
+                )
                 sys.stdout.flush()
                 self.last_message = message
 

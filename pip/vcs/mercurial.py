@@ -1,13 +1,13 @@
 import os
 import tempfile
 import re
-import sys
+
 from pip.util import call_subprocess
 from pip.util import display_path, rmtree
 from pip.log import logger
 from pip.vcs import vcs, VersionControl
-from pip.download import path_to_url2
-from pip.backwardcompat import ConfigParser
+from pip.download import path_to_url
+from pip.compat import ConfigParser
 
 
 class Mercurial(VersionControl):
@@ -15,24 +15,6 @@ class Mercurial(VersionControl):
     dirname = '.hg'
     repo_name = 'clone'
     schemes = ('hg', 'hg+http', 'hg+https', 'hg+ssh', 'hg+static-http')
-    bundle_file = 'hg-clone.txt'
-    guide = ('# This was a Mercurial repo; to make it a repo again run:\n'
-            'hg init\nhg pull %(url)s\nhg update -r %(rev)s\n')
-
-    def parse_vcs_bundle_file(self, content):
-        url = rev = None
-        for line in content.splitlines():
-            if not line.strip() or line.strip().startswith('#'):
-                continue
-            url_match = re.search(r'hg\s*pull\s*(.*)\s*', line)
-            if url_match:
-                url = url_match.group(1).strip()
-            rev_match = re.search(r'^hg\s*update\s*-r\s*(.*)\s*', line)
-            if rev_match:
-                rev = rev_match.group(1).strip()
-            if url and rev:
-                return url, rev
-        return None, None
 
     def export(self, location):
         """Export the Hg repository at the url to the destination location"""
@@ -54,11 +36,10 @@ class Mercurial(VersionControl):
             config_file = open(repo_config, 'w')
             config.write(config_file)
             config_file.close()
-        except (OSError, ConfigParser.NoSectionError):
-            e = sys.exc_info()[1]
+        except (OSError, ConfigParser.NoSectionError) as exc:
             logger.warn(
                 'Could not switch Mercurial repository to %s: %s'
-                % (url, e))
+                % (url, exc))
         else:
             call_subprocess([self.cmd, 'update', '-q'] + rev_options, cwd=dest)
 
@@ -86,7 +67,7 @@ class Mercurial(VersionControl):
             [self.cmd, 'showconfig', 'paths.default'],
             show_stdout=False, cwd=location).strip()
         if self._is_local_repository(url):
-            url = path_to_url2(url)
+            url = path_to_url(url)
         return url.strip()
 
     def get_tag_revs(self, location):
@@ -143,7 +124,10 @@ class Mercurial(VersionControl):
             full_egg_name = '%s-%s' % (egg_project_name, tag_revs[current_rev])
         elif current_rev in branch_revs:
             # It's the tip of a branch
-            full_egg_name = '%s-%s' % (egg_project_name, branch_revs[current_rev])
+            full_egg_name = '%s-%s' % (
+                egg_project_name,
+                branch_revs[current_rev],
+            )
         else:
             full_egg_name = '%s-dev' % egg_project_name
         return '%s@%s#egg=%s' % (repo, current_rev_hash, full_egg_name)
