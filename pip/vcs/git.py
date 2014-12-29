@@ -1,14 +1,22 @@
+from __future__ import absolute_import
+
+import logging
 import tempfile
 import os.path
 
-from pip.util import call_subprocess
-from pip.util import display_path, rmtree
-from pip.vcs import vcs, VersionControl
-from pip.log import logger
-from pip.compat import url2pathname, urlparse
+from pip._vendor.six.moves.urllib import parse as urllib_parse
+from pip._vendor.six.moves.urllib import request as urllib_request
 
-urlsplit = urlparse.urlsplit
-urlunsplit = urlparse.urlunsplit
+from pip.utils import call_subprocess
+from pip.utils import display_path, rmtree
+from pip.vcs import vcs, VersionControl
+
+
+urlsplit = urllib_parse.urlsplit
+urlunsplit = urllib_parse.urlunsplit
+
+
+logger = logging.getLogger(__name__)
 
 
 class Git(VersionControl):
@@ -29,7 +37,8 @@ class Git(VersionControl):
                 initial_slashes = path[:-len(path.lstrip('/'))]
                 newpath = (
                     initial_slashes +
-                    url2pathname(path).replace('\\', '/').lstrip('/')
+                    urllib_request.url2pathname(path)
+                    .replace('\\', '/').lstrip('/')
                 )
                 url = urlunsplit((scheme, netloc, newpath, query, fragment))
                 after_plus = scheme.find('+') + 1
@@ -67,8 +76,8 @@ class Git(VersionControl):
             # a local tag or branch name
             return [revisions[rev]]
         else:
-            logger.warn(
-                "Could not find a tag or branch '%s', assuming commit." % rev,
+            logger.warning(
+                "Could not find a tag or branch '%s', assuming commit.", rev,
             )
             return rev_options
 
@@ -104,12 +113,11 @@ class Git(VersionControl):
             rev_options = ['origin/master']
             rev_display = ''
         if self.check_destination(dest, url, rev_options, rev_display):
-            logger.notify(
-                'Cloning %s%s to %s' % (url, rev_display, display_path(dest)),
+            logger.info(
+                'Cloning %s%s to %s', url, rev_display, display_path(dest),
             )
             call_subprocess([self.cmd, 'clone', '-q', url, dest])
-            #: repo may contain submodules
-            self.update_submodules(dest)
+
             if rev:
                 rev_options = self.check_rev_options(rev, dest, rev_options)
                 # Only do a checkout if rev_options differs from HEAD
@@ -118,6 +126,8 @@ class Git(VersionControl):
                         [self.cmd, 'checkout', '-q'] + rev_options,
                         cwd=dest,
                     )
+            #: repo may contain submodules
+            self.update_submodules(dest)
 
     def get_url(self, location):
         url = call_subprocess(
@@ -159,13 +169,18 @@ class Git(VersionControl):
         current_rev = self.get_revision(location)
         refs = self.get_refs(location)
         # refs maps names to commit hashes; we need the inverse
-        # if multiple names map to a single commit, this arbitrarily picks one
-        names_by_commit = dict((commit, ref) for ref, commit in refs.items())
+        # if multiple names map to a single commit, we pick the first one
+        # alphabetically
+        names_by_commit = {}
+        for ref, commit in sorted(refs.items()):
+            if commit not in names_by_commit:
+                names_by_commit[commit] = ref
 
         if current_rev in names_by_commit:
-            # It's a tag
+            # It's a tag or branch.
+            name = names_by_commit[current_rev]
             full_egg_name = (
-                '%s-%s' % (egg_project_name, names_by_commit[current_rev])
+                '%s-%s' % (egg_project_name, self.translate_egg_surname(name))
             )
         else:
             full_egg_name = '%s-dev' % egg_project_name

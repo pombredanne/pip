@@ -1,3 +1,4 @@
+
 import os
 import textwrap
 import glob
@@ -6,7 +7,7 @@ from os.path import join, curdir, pardir
 
 import pytest
 
-from pip.util import rmtree
+from pip.utils import rmtree
 from tests.lib import pyversion
 from tests.lib.local_repos import local_checkout
 from tests.lib.path import Path
@@ -62,8 +63,8 @@ def test_editable_install(script):
         "INITools==0.2 should either be a path to a local project or a VCS url"
         in result.stdout
     )
-    assert len(result.files_created) == 1, result.files_created
-    assert not result.files_updated, result.files_updated
+    assert not result.files_created
+    assert not result.files_updated
 
 
 def test_install_editable_from_svn(script, tmpdir):
@@ -201,7 +202,7 @@ def test_install_dev_version_from_pypi(script):
     Test using package==dev.
     """
     result = script.pip(
-        'install', 'INITools==dev',
+        'install', 'INITools===dev',
         '--allow-external', 'INITools',
         '--allow-unverified', 'INITools',
         expect_error=True,
@@ -248,17 +249,13 @@ def test_vcs_url_final_slash_normalization(script, tmpdir):
     """
     Test that presence or absence of final slash in VCS URL is normalized.
     """
-    result = script.pip(
+    script.pip(
         'install', '-e',
         '%s/#egg=ScriptTest' %
         local_checkout(
             'hg+https://bitbucket.org/ianb/scripttest',
             tmpdir.join("cache"),
         ),
-        expect_error=True,
-    )
-    assert 'pip-log.txt' not in result.files_created, (
-        result.files_created['pip-log.txt'].bytes
     )
 
 
@@ -283,7 +280,7 @@ def test_vcs_url_urlquote_normalization(script, tmpdir):
     """
     Test that urlquoted characters are normalized for repo URL comparison.
     """
-    result = script.pip(
+    script.pip(
         'install', '-e',
         '%s/#egg=django-wikiapp' %
         local_checkout(
@@ -291,10 +288,6 @@ def test_vcs_url_urlquote_normalization(script, tmpdir):
             '/release-0.1',
             tmpdir.join("cache"),
         ),
-        expect_error=True,
-    )
-    assert 'pip-log.txt' not in result.files_created, (
-        result.files_created['pip-log.txt'].bytes
     )
 
 
@@ -306,7 +299,7 @@ def test_install_from_local_directory(script, data):
     result = script.pip('install', to_install, expect_error=False)
     fspkg_folder = script.site_packages / 'fspkg'
     egg_info_folder = (
-        script.site_packages / 'FSPkg-0.1dev-py%s.egg-info' % pyversion
+        script.site_packages / 'FSPkg-0.1.dev0-py%s.egg-info' % pyversion
     )
     assert fspkg_folder in result.files_created, str(result.stdout)
     assert egg_info_folder in result.files_created, str(result)
@@ -321,7 +314,7 @@ def test_install_from_local_directory_with_symlinks_to_directories(
     result = script.pip('install', to_install, expect_error=False)
     pkg_folder = script.site_packages / 'symlinks'
     egg_info_folder = (
-        script.site_packages / 'symlinks-0.1dev-py%s.egg-info' % pyversion
+        script.site_packages / 'symlinks-0.1.dev0-py%s.egg-info' % pyversion
     )
     assert pkg_folder in result.files_created, str(result.stdout)
     assert egg_info_folder in result.files_created, str(result)
@@ -332,8 +325,7 @@ def test_install_from_local_directory_with_no_setup_py(script, data):
     Test installing from a local directory with no 'setup.py'.
     """
     result = script.pip('install', data.root, expect_error=True)
-    assert len(result.files_created) == 1, result.files_created
-    assert 'pip-log.txt' in result.files_created, result.files_created
+    assert not result.files_created
     assert "is not installable. File 'setup.py' not found." in result.stdout
 
 
@@ -342,8 +334,7 @@ def test_editable_install_from_local_directory_with_no_setup_py(script, data):
     Test installing from a local directory with no 'setup.py'.
     """
     result = script.pip('install', '-e', data.root, expect_error=True)
-    assert len(result.files_created) == 1, result.files_created
-    assert 'pip-log.txt' in result.files_created, result.files_created
+    assert not result.files_created
     assert "is not installable. File 'setup.py' not found." in result.stdout
 
 
@@ -354,7 +345,7 @@ def test_install_as_egg(script, data):
     to_install = data.packages.join("FSPkg")
     result = script.pip('install', to_install, '--egg', expect_error=False)
     fspkg_folder = script.site_packages / 'fspkg'
-    egg_folder = script.site_packages / 'FSPkg-0.1dev-py%s.egg' % pyversion
+    egg_folder = script.site_packages / 'FSPkg-0.1.dev0-py%s.egg' % pyversion
     assert fspkg_folder not in result.files_created, str(result.stdout)
     assert egg_folder in result.files_created, str(result)
     assert join(egg_folder, 'fspkg') in result.files_created, str(result)
@@ -372,7 +363,7 @@ def test_install_curdir(script, data):
     result = script.pip('install', curdir, cwd=run_from, expect_error=False)
     fspkg_folder = script.site_packages / 'fspkg'
     egg_info_folder = (
-        script.site_packages / 'FSPkg-0.1dev-py%s.egg-info' % pyversion
+        script.site_packages / 'FSPkg-0.1.dev0-py%s.egg-info' % pyversion
     )
     assert fspkg_folder in result.files_created, str(result.stdout)
     assert egg_info_folder in result.files_created, str(result)
@@ -386,7 +377,7 @@ def test_install_pardir(script, data):
     result = script.pip('install', pardir, cwd=run_from, expect_error=False)
     fspkg_folder = script.site_packages / 'fspkg'
     egg_info_folder = (
-        script.site_packages / 'FSPkg-0.1dev-py%s.egg-info' % pyversion
+        script.site_packages / 'FSPkg-0.1.dev0-py%s.egg-info' % pyversion
     )
     assert fspkg_folder in result.files_created, str(result.stdout)
     assert egg_info_folder in result.files_created, str(result)
@@ -416,7 +407,7 @@ def test_install_with_hacked_egg_info(script, data):
     """
     run_from = data.packages.join("HackedEggInfo")
     result = script.pip('install', '.', cwd=run_from)
-    assert 'Successfully installed hackedegginfo\n' in result.stdout
+    assert 'Successfully installed hackedegginfo-0.0.0\n' in result.stdout
 
 
 def test_install_using_install_option_and_editable(script, tmpdir):
@@ -524,6 +515,33 @@ def test_install_package_with_target(script):
     target_dir = script.scratch_path / 'target'
     result = script.pip('install', '-t', target_dir, "initools==0.1")
     assert Path('scratch') / 'target' / 'initools' in result.files_created, (
+        str(result)
+    )
+
+    # Test repeated call without --upgrade, no files should have changed
+    result = script.pip('install', '-t', target_dir, "initools==0.1")
+    assert not Path('scratch') / 'target' / 'initools' in result.files_updated
+
+    # Test upgrade call, check that new version is installed
+    result = script.pip('install', '--upgrade', '-t',
+                        target_dir, "initools==0.2")
+    assert Path('scratch') / 'target' / 'initools' in result.files_updated, (
+        str(result)
+    )
+    egg_folder = (
+        Path('scratch') / 'target' / 'INITools-0.2-py%s.egg-info' % pyversion)
+    assert egg_folder in result.files_created, (
+        str(result)
+    )
+
+    # Test install and upgrade of single-module package
+    result = script.pip('install', '-t', target_dir, 'six')
+    assert Path('scratch') / 'target' / 'six.py' in result.files_created, (
+        str(result)
+    )
+
+    result = script.pip('install', '-t', target_dir, '--upgrade', 'six')
+    assert Path('scratch') / 'target' / 'six.py' in result.files_updated, (
         str(result)
     )
 

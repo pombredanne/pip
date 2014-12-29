@@ -1,11 +1,22 @@
+from __future__ import absolute_import
+
+import logging
 import os
 import tempfile
 import re
-from pip.compat import urlparse
-from pip.log import logger
-from pip.util import rmtree, display_path, call_subprocess
+
+# TODO: Get this into six.moves.urllib.parse
+try:
+    from urllib import parse as urllib_parse
+except ImportError:
+    import urlparse as urllib_parse
+
+from pip.utils import rmtree, display_path, call_subprocess
 from pip.vcs import vcs, VersionControl
 from pip.download import path_to_url
+
+
+logger = logging.getLogger(__name__)
 
 
 class Bazaar(VersionControl):
@@ -21,9 +32,9 @@ class Bazaar(VersionControl):
         super(Bazaar, self).__init__(url, *args, **kwargs)
         # Python >= 2.7.4, 3.3 doesn't have uses_fragment or non_hierarchical
         # Register lp but do not expose as a scheme to support bzr+lp.
-        if getattr(urlparse, 'uses_fragment', None):
-            urlparse.uses_fragment.extend(['lp'])
-            urlparse.non_hierarchical.extend(['lp'])
+        if getattr(urllib_parse, 'uses_fragment', None):
+            urllib_parse.uses_fragment.extend(['lp'])
+            urllib_parse.non_hierarchical.extend(['lp'])
 
     def export(self, location):
         """
@@ -56,8 +67,12 @@ class Bazaar(VersionControl):
             rev_options = []
             rev_display = ''
         if self.check_destination(dest, url, rev_options, rev_display):
-            logger.notify('Checking out %s%s to %s'
-                          % (url, rev_display, display_path(dest)))
+            logger.info(
+                'Checking out %s%s to %s',
+                url,
+                rev_display,
+                display_path(dest),
+            )
             call_subprocess(
                 [self.cmd, 'branch', '-q'] + rev_options + [url, dest])
 
@@ -101,11 +116,11 @@ class Bazaar(VersionControl):
 
     def get_src_requirement(self, dist, location, find_tags):
         repo = self.get_url(location)
+        if not repo:
+            return None
         if not repo.lower().startswith('bzr:'):
             repo = 'bzr+' + repo
         egg_project_name = dist.egg_name().split('-', 1)[0]
-        if not repo:
-            return None
         current_rev = self.get_revision(location)
         tag_revs = self.get_tag_revs(location)
 

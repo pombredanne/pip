@@ -1,13 +1,15 @@
 import hashlib
 import os
+from io import BytesIO
 from shutil import rmtree, copy
 from tempfile import mkdtemp
+
+from pip._vendor.six.moves.urllib import request as urllib_request
 
 from mock import Mock, patch
 import pytest
 
 import pip
-from pip.compat import BytesIO, b, pathname2url
 from pip.exceptions import HashMismatch
 from pip.download import (
     PipSession, SafeFileCache, path_to_url, unpack_http_url, url_to_path,
@@ -83,7 +85,7 @@ def test_unpack_http_url_bad_downloaded_checksum(mock_unpack_file):
     If already-downloaded file has bad checksum, re-download.
     """
     base_url = 'http://www.example.com/somepackage.tgz'
-    contents = b('downloaded')
+    contents = b'downloaded'
     download_hash = hashlib.new('sha1', contents)
     link = Link(base_url + '#sha1=' + download_hash.hexdigest())
 
@@ -123,7 +125,7 @@ def test_unpack_http_url_bad_downloaded_checksum(mock_unpack_file):
 def test_path_to_url_unix():
     assert path_to_url('/tmp/file') == 'file:///tmp/file'
     path = os.path.join(os.getcwd(), 'file')
-    assert path_to_url('file') == 'file://' + pathname2url(path)
+    assert path_to_url('file') == 'file://' + urllib_request.pathname2url(path)
 
 
 @pytest.mark.skipif("sys.platform == 'win32'")
@@ -133,15 +135,26 @@ def test_url_to_path_unix():
 
 @pytest.mark.skipif("sys.platform != 'win32'")
 def test_path_to_url_win():
-    assert path_to_url('c:/tmp/file') == 'file:///c:/tmp/file'
-    assert path_to_url('c:\\tmp\\file') == 'file:///c:/tmp/file'
+    assert path_to_url('c:/tmp/file') == 'file:///C:/tmp/file'
+    assert path_to_url('c:\\tmp\\file') == 'file:///C:/tmp/file'
+    assert path_to_url(r'\\unc\as\path') == 'file://unc/as/path'
     path = os.path.join(os.getcwd(), 'file')
-    assert path_to_url('file') == 'file:' + pathname2url(path)
+    assert path_to_url('file') == 'file:' + urllib_request.pathname2url(path)
 
 
 @pytest.mark.skipif("sys.platform != 'win32'")
 def test_url_to_path_win():
-    assert url_to_path('file:///c:/tmp/file') == 'c:/tmp/file'
+    assert url_to_path('file:///c:/tmp/file') == 'C:\\tmp\\file'
+    assert url_to_path('file://unc/as/path') == r'\\unc\as\path'
+
+
+@pytest.mark.skipif("sys.platform != 'win32'")
+def test_url_to_path_path_to_url_symmetry_win():
+    path = r'C:\tmp\file'
+    assert url_to_path(path_to_url(path)) == path
+
+    unc_path = r'\\unc\share\path'
+    assert url_to_path(path_to_url(unc_path)) == unc_path
 
 
 class Test_unpack_file_url(object):
@@ -291,10 +304,20 @@ class TestPipSession:
     def test_cache_is_enabled(self, tmpdir):
         session = PipSession(cache=tmpdir.join("test-cache"))
 
-        assert hasattr(session.adapters["http://"], "cache")
         assert hasattr(session.adapters["https://"], "cache")
 
-        assert (session.adapters["http://"].cache.directory
-                == tmpdir.join("test-cache"))
         assert (session.adapters["https://"].cache.directory
                 == tmpdir.join("test-cache"))
+
+    def test_http_cache_is_not_enabled(self, tmpdir):
+        session = PipSession(cache=tmpdir.join("test-cache"))
+
+        assert not hasattr(session.adapters["http://"], "cache")
+
+    def test_insecure_host_cache_is_not_enabled(self, tmpdir):
+        session = PipSession(
+            cache=tmpdir.join("test-cache"),
+            insecure_hosts=["example.com"],
+        )
+
+        assert not hasattr(session.adapters["https://example.com/"], "cache")

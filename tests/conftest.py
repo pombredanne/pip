@@ -10,6 +10,34 @@ from tests.lib.scripttest import PipTestEnvironment
 from tests.lib.venv import VirtualEnvironment
 
 
+def pytest_collection_modifyitems(items):
+    for item in items:
+        module_path = os.path.relpath(
+            item.module.__file__,
+            os.path.commonprefix([__file__, item.module.__file__]),
+        )
+
+        module_root_dir = module_path.split(os.pathsep)[0]
+        if (module_root_dir.startswith("functional")
+                or module_root_dir.startswith("integration")
+                or module_root_dir.startswith("lib")):
+            item.add_marker(pytest.mark.integration)
+        elif module_root_dir.startswith("unit"):
+            item.add_marker(pytest.mark.unit)
+
+            # We don't want to allow using the script resource if this is a
+            # unit test, as unit tests should not need all that heavy lifting
+            if set(getattr(item, "funcargnames", [])) & set(["script"]):
+                raise RuntimeError(
+                    "Cannot use the ``script`` funcarg in a unit test: "
+                    "(filename = {0}, item = {1})".format(module_path, item)
+                )
+        else:
+            raise RuntimeError(
+                "Unknown test type (filename = {0})".format(module_path)
+            )
+
+
 @pytest.fixture
 def tmpdir(request):
     """
@@ -77,6 +105,9 @@ def isolate(tmpdir):
     os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
     os.environ["GIT_AUTHOR_NAME"] = "pip"
     os.environ["GIT_AUTHOR_EMAIL"] = "pypa-dev@googlegroups.com"
+
+    # We want to disable the version check from running in the tests
+    os.environ["PIP_DISABLE_PIP_VERSION_CHECK"] = "true"
 
     os.makedirs(os.path.join(home_dir, ".config", "git"))
     with open(os.path.join(home_dir, ".config", "git", "config"), "wb") as fp:

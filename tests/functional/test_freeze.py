@@ -113,16 +113,17 @@ def test_freeze_git_clone(script, tmpdir):
         'pip-test-package',
         expect_stderr=True,
     )
+    repo_dir = script.scratch_path / 'pip-test-package'
     result = script.run(
         'git',
         'checkout',
         '7d654e66c8fa7149c165ddeffa5b56bc06619458',
-        cwd=script.scratch_path / 'pip-test-package',
+        cwd=repo_dir,
         expect_stderr=True,
     )
     result = script.run(
         'python', 'setup.py', 'develop',
-        cwd=script.scratch_path / 'pip-test-package'
+        cwd=repo_dir
     )
     result = script.pip('freeze', expect_stderr=True)
     expected = textwrap.dedent(
@@ -162,6 +163,31 @@ def test_freeze_git_clone(script, tmpdir):
                 tmpdir.join("cache"),
             ),
         },
+    ).strip()
+    _check_output(result, expected)
+
+    # Check that slashes in branch or tag names are translated.
+    # See also issue #1083: https://github.com/pypa/pip/issues/1083
+    script.run(
+        'git', 'checkout', '-b', 'branch/name/with/slash',
+        cwd=repo_dir,
+        expect_stderr=True,
+    )
+    # Create a new commit to ensure that the commit has only one branch
+    # or tag name associated to it (to avoid the non-determinism reported
+    # in issue #1867).
+    script.run(
+        'git', 'revert', '--no-edit', 'HEAD',
+        cwd=repo_dir,
+    )
+    result = script.pip('freeze', expect_stderr=True)
+    expected = textwrap.dedent(
+        """
+            Script result: ...pip freeze
+            -- stdout: --------------------
+            ...-e ...@...#egg=pip_test_package-branch_name_with_slash...
+            ...
+        """
     ).strip()
     _check_output(result, expected)
 
@@ -340,5 +366,22 @@ Requirement file contains NoExist==4.2, but that package is not installed
 
 -- stdout: --------------------
 INITools==0.2
-""" + ignores + "## The following requirements were added by pip --freeze:..."
+""" + ignores + "## The following requirements were added by pip freeze:..."
     _check_output(result, expected)
+
+
+def test_freeze_user(script, virtualenv):
+    """
+    Testing freeze with --user, first we have to install some stuff.
+    """
+    virtualenv.system_site_packages = True
+    script.pip_install_local('--user', 'simple==2.0')
+    script.pip_install_local('simple2==3.0')
+    result = script.pip('freeze', '--user', expect_stderr=True)
+    expected = textwrap.dedent("""\
+        Script result: pip freeze --user
+        -- stdout: --------------------
+        simple==2.0
+        <BLANKLINE>""")
+    _check_output(result, expected)
+    assert 'simple2' not in result.stdout

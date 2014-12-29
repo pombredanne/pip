@@ -1,7 +1,5 @@
 from io import BytesIO
 
-from .compat import is_fp_closed
-
 
 class CallbackFileWrapper(object):
     """
@@ -21,15 +19,45 @@ class CallbackFileWrapper(object):
         self.__callback = callback
 
     def __getattr__(self, name):
-        return getattr(self.__fp, name)
+        # The vaguaries of garbage collection means that self.__fp is
+        # not always set.  By using __getattribute__ and the private
+        # name[0] allows looking up the attribute value and raising an
+        # AttributeError when it doesn't exist. This stop thigns from
+        # infinitely recursing calls to getattr in the case where
+        # self.__fp hasn't been set.
+        #
+        # [0] https://docs.python.org/2/reference/expressions.html#atom-identifiers
+        fp = self.__getattribute__('_CallbackFileWrapper__fp')
+        return getattr(fp, name)
+
+    def __is_fp_closed(self):
+        try:
+            return self.__fp.fp is None
+        except AttributeError:
+            pass
+
+        try:
+            return self.__fp.closed
+        except AttributeError:
+            pass
+
+        # We just don't cache it then.
+        # TODO: Add some logging here...
+        return False
 
     def read(self, amt=None):
         data = self.__fp.read(amt)
         self.__buf.write(data)
 
-        # Is this the best way to figure out if the file has been completely
-        #   consumed?
-        if is_fp_closed(self.__fp):
-            self.__callback(self.__buf.getvalue())
+        if self.__is_fp_closed():
+            if self.__callback:
+                self.__callback(self.__buf.getvalue())
+
+            # We assign this to None here, because otherwise we can get into
+            # really tricky problems where the CPython interpreter dead locks
+            # because the callback is holding a reference to something which
+            # has a __del__ method. Setting this to None breaks the cycle
+            # and allows the garbage collector to do it's thing normally.
+            self.__callback = None
 
         return data

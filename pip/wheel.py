@@ -1,33 +1,41 @@
 """
 Support for installing and building the "wheel" binary package format.
 """
-from __future__ import with_statement
+from __future__ import absolute_import
 
 import compileall
 import csv
 import functools
 import hashlib
+import logging
 import os
 import re
 import shutil
+import stat
 import sys
 
 from base64 import urlsafe_b64encode
 from email.parser import Parser
 
-from pip.compat import ConfigParser, StringIO, binary
+from pip._vendor.six import StringIO
+
 from pip.exceptions import InvalidWheelFilename, UnsupportedWheel
 from pip.locations import distutils_scheme
-from pip.log import logger
 from pip import pep425tags
-from pip.util import call_subprocess, normalize_path, make_path_relative
+from pip.utils import (call_subprocess, normalize_path, make_path_relative,
+                       captured_stdout, remove_tracebacks)
+from pip.utils.logging import indent_log
 from pip._vendor.distlib.scripts import ScriptMaker
 from pip._vendor import pkg_resources
+from pip._vendor.six.moves import configparser
 
 
 wheel_ext = '.whl'
 
 VERSION_COMPATIBLE = (1, 0)
+
+
+logger = logging.getLogger(__name__)
 
 
 def rehash(path, algo='sha256', blocksize=1 << 20):
@@ -61,22 +69,16 @@ def fix_script(path):
     Return True if file was changed."""
     # XXX RECORD hashes will need to be updated
     if os.path.isfile(path):
-        script = open(path, 'rb')
-        try:
+        with open(path, 'rb') as script:
             firstline = script.readline()
-            if not firstline.startswith(binary('#!python')):
+            if not firstline.startswith(b'#!python'):
                 return False
             exename = sys.executable.encode(sys.getfilesystemencoding())
-            firstline = binary('#!') + exename + binary(os.linesep)
+            firstline = b'#!' + exename + os.linesep.encode("ascii")
             rest = script.read()
-        finally:
-            script.close()
-        script = open(path, 'wb')
-        try:
+        with open(path, 'wb') as script:
             script.write(firstline)
             script.write(rest)
-        finally:
-            script.close()
         return True
 
 dist_info_re = re.compile(r"""^(?P<namever>(?P<name>.+?)(-(?P<ver>\d.+?))?)
@@ -114,7 +116,7 @@ def get_entrypoints(filename):
             data.write("\n")
         data.seek(0)
 
-    cp = ConfigParser.RawConfigParser()
+    cp = configparser.RawConfigParser()
     cp.readfp(data)
 
     console = {}
@@ -127,11 +129,13 @@ def get_entrypoints(filename):
 
 
 def move_wheel_files(name, req, wheeldir, user=False, home=None, root=None,
-                     pycompile=True, scheme=None):
+                     pycompile=True, scheme=None, isolated=False):
     """Install a wheel"""
 
     if not scheme:
-        scheme = distutils_scheme(name, user=user, home=home, root=root)
+        scheme = distutils_scheme(
+            name, user=user, home=home, root=root, isolated=isolated
+        )
 
     if root_is_purelib(name, wheeldir):
         lib_dir = scheme['purelib']
@@ -152,7 +156,9 @@ def move_wheel_files(name, req, wheeldir, user=False, home=None, root=None,
 
     # Compile all of the pyc files that we're going to be installing
     if pycompile:
-        compileall.compile_dir(source, force=True, quiet=True)
+        with captured_stdout() as stdout:
+            compileall.compile_dir(source, force=True, quiet=True)
+        logger.info(remove_tracebacks(stdout.getvalue()))
 
     def normpath(src, p):
         return make_path_relative(src, p).replace(os.path.sep, '/')
@@ -197,10 +203,29 @@ def move_wheel_files(name, req, wheeldir, user=False, home=None, root=None,
                 # uninstalled.
                 if not os.path.exists(destdir):
                     os.makedirs(destdir)
-                # use copy2 (not move) to be extra sure we're not moving
-                # directories over; copy2 fails for directories.  this would
-                # fail tests (not during released/user execution)
-                shutil.copy2(srcfile, destfile)
+
+                # We use copyfile (not move, copy, or copy2) to be extra sure
+                # that we are not moving directories over (copyfile fails for
+                # directories) as well as to ensure that we are not copying
+                # over any metadata because we want more control over what
+                # metadata we actually copy over.
+                shutil.copyfile(srcfile, destfile)
+
+                # Copy over the metadata for the file, currently this only
+                # includes the atime and mtime.
+                st = os.stat(srcfile)
+                if hasattr(os, "utime"):
+                    os.utime(destfile, (st.st_atime, st.st_mtime))
+
+                # If our file is executable, then make our destination file
+                # executable.
+                if os.access(srcfile, os.X_OK):
+                    st = os.stat(srcfile)
+                    permissions = (
+                        st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+                    )
+                    os.chmod(destfile, permissions)
+
                 changed = False
                 if fixer:
                     changed = fixer(destfile)
@@ -241,6 +266,10 @@ def move_wheel_files(name, req, wheeldir, user=False, home=None, root=None,
             clobber(source, dest, False, fixer=fixer, filter=filter)
 
     maker = ScriptMaker(None, scheme['scripts'])
+
+    # Ensure old scripts are overwritten.
+    # See https://github.com/pypa/pip/issues/1800
+    maker.clobber = True
 
     # Ensure we don't generate any variants for scripts because this is almost
     # never what somebody wants.
@@ -393,7 +422,7 @@ def uninstallation_paths(dist):
 
     UninstallPathSet.add() takes care of the __pycache__ .pyc.
     """
-    from pip.util import FakeFile  # circular import
+    from pip.utils import FakeFile  # circular import
     r = csv.reader(FakeFile(dist.get_metadata_lines('RECORD')))
     for row in r:
         path = os.path.join(dist.location, row[0])
@@ -447,8 +476,10 @@ def check_compatibility(version, name):
             "of pip" % (name, '.'.join(map(str, version)))
         )
     elif version > VERSION_COMPATIBLE:
-        logger.warn('Installing from a newer Wheel-Version (%s)'
-                    % '.'.join(map(str, version)))
+        logger.warning(
+            'Installing from a newer Wheel-Version (%s)',
+            '.'.join(map(str, version)),
+        )
 
 
 class Wheel(object):
@@ -509,13 +540,13 @@ class Wheel(object):
 class WheelBuilder(object):
     """Build wheels from a RequirementSet."""
 
-    def __init__(self, requirement_set, finder, wheel_dir, build_options=[],
-                 global_options=[]):
+    def __init__(self, requirement_set, finder, wheel_dir, build_options=None,
+                 global_options=None):
         self.requirement_set = requirement_set
         self.finder = finder
         self.wheel_dir = normalize_path(wheel_dir)
-        self.build_options = build_options
-        self.global_options = global_options
+        self.build_options = build_options or []
+        self.global_options = global_options or []
 
     def _build_one(self, req):
         """Build one wheel."""
@@ -527,15 +558,15 @@ class WheelBuilder(object):
             "__file__, 'exec'))" % req.setup_py
         ] + list(self.global_options)
 
-        logger.notify('Running setup.py bdist_wheel for %s' % req.name)
-        logger.notify('Destination directory: %s' % self.wheel_dir)
+        logger.info('Running setup.py bdist_wheel for %s', req.name)
+        logger.info('Destination directory: %s', self.wheel_dir)
         wheel_args = base_args + ['bdist_wheel', '-d', self.wheel_dir] \
             + self.build_options
         try:
             call_subprocess(wheel_args, cwd=req.source_dir, show_stdout=False)
             return True
         except:
-            logger.error('Failed building wheel for %s' % req.name)
+            logger.error('Failed building wheel for %s', req.name)
             return False
 
     def build(self):
@@ -549,11 +580,13 @@ class WheelBuilder(object):
         buildset = []
         for req in reqset:
             if req.is_wheel:
-                logger.notify(
-                    'Skipping %s, due to already being wheel.' % req.name)
+                logger.info(
+                    'Skipping %s, due to already being wheel.', req.name,
+                )
             elif req.editable:
-                logger.notify(
-                    'Skipping %s, due to being editable' % req.name)
+                logger.info(
+                    'Skipping %s, due to being editable', req.name,
+                )
             else:
                 buildset.append(req)
 
@@ -561,29 +594,28 @@ class WheelBuilder(object):
             return True
 
         # Build the wheels.
-        logger.notify(
-            'Building wheels for collected packages: %s' %
-            ', '.join([req.name for req in buildset])
+        logger.info(
+            'Building wheels for collected packages: %s',
+            ', '.join([req.name for req in buildset]),
         )
-        logger.indent += 2
-        build_success, build_failure = [], []
-        for req in buildset:
-            if self._build_one(req):
-                build_success.append(req)
-            else:
-                build_failure.append(req)
-        logger.indent -= 2
+        with indent_log():
+            build_success, build_failure = [], []
+            for req in buildset:
+                if self._build_one(req):
+                    build_success.append(req)
+                else:
+                    build_failure.append(req)
 
         # notify success/failure
         if build_success:
-            logger.notify(
-                'Successfully built %s' %
-                ' '.join([req.name for req in build_success])
+            logger.info(
+                'Successfully built %s',
+                ' '.join([req.name for req in build_success]),
             )
         if build_failure:
-            logger.notify(
-                'Failed to build %s' %
-                ' '.join([req.name for req in build_failure])
+            logger.info(
+                'Failed to build %s',
+                ' '.join([req.name for req in build_failure]),
             )
         # Return True if all builds were successful
         return len(build_failure) == 0

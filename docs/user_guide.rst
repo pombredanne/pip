@@ -237,12 +237,54 @@ pip allows you to set all command line option defaults in a standard ini
 style config file.
 
 The names and locations of the configuration files vary slightly across
-platforms.
+platforms. You may have per-user, per-virtualenv or site-wide (shared amongst
+all users) configuration:
+
+**Per-user**:
+
+* On Unix the default configuration file is: :file:`$HOME/.config/pip/pip.conf`
+  which respects the ``XDG_CONFIG_HOME`` environment variable.
+* On Mac OS X the configuration file is
+  :file:`$HOME/Library/Application Support/pip/pip.conf`.
+* On Windows the configuration file is :file:`%APPDATA%\\pip\\pip.ini`.
+
+There are also a legacy per-user configuration file which is also respected,
+these are located at:
 
 * On Unix and Mac OS X the configuration file is: :file:`$HOME/.pip/pip.conf`
-* On Windows, the configuration file is: :file:`%HOME%\\pip\\pip.ini`
+* On Windows the configuration file is: :file:`%HOME%\\pip\\pip.ini`
 
-You can set a custom path location for the config file using the environment variable ``PIP_CONFIG_FILE``.
+You can set a custom path location for this config file using the environment
+variable ``PIP_CONFIG_FILE``.
+
+**Inside a virtualenv**:
+
+* On Unix and Mac OS X the file is :file:`$VIRTUAL_ENV/pip.conf`
+* On Windows the file is: :file:`%VIRTUAL_ENV%\\pip.ini`
+
+**Site-wide**:
+
+* On Unix the file may be located in in :file:`/etc/pip.conf`. Alternatively
+  it may be in a "pip" subdirectory of any of the paths set in the
+  environment variable ``XDG_CONFIG_DIRS`` (if it exists), for example
+  :file:`/etc/xdg/pip/pip.conf`.
+* On Mac OS X the file is: :file:`/Library/Application Support/pip/pip.conf`
+* On Windows XP the file is:
+  :file:`C:\\Documents and Settings\\All Users\\Application Data\\PyPA\\pip\\pip.conf`
+* On Windows 7 and later the file is hidden, but writeable at
+  :file:`C:\\ProgramData\\PyPA\\pip\\pip.conf`
+* Site-wide configuration is not supported on Windows Vista
+
+If multiple configuration files are found by pip then they are combined in
+the following order:
+
+1. Firstly the site-wide file is read, then
+2. The per-user file is read, and finally
+3. The virtualenv-specific file is read.
+
+Each file read overrides any values read from previous files, so if the
+global timeout is specified in both the site-wide file and the per-user file
+then the latter value is the one that will be used.
 
 The names of the settings are derived from the long command line option, e.g.
 if you want to use a different package index (``--index-url``) and set the
@@ -369,12 +411,12 @@ Then, install using  :ref:`--find-links <--find-links>` and :ref:`--no-index <--
 $ pip install --no-index --find-links=[file://]<DIR> -r requirements.txt
 
 
-Non-recursive upgrades
-************************
+"Only if needed" Recursive Upgrade
+**********************************
 
-``pip install --upgrade`` is currently written to perform a recursive upgrade,
-i.e. it upgrades all dependencies regardless of whether they still satisfy the
-new parent requirements.
+``pip install --upgrade`` is currently written to perform an eager recursive
+upgrade, i.e. it upgrades all dependencies regardless of whether they still
+satisfy the new parent requirements.
 
 E.g. supposing:
 
@@ -386,8 +428,8 @@ E.g. supposing:
 Running ``pip install --upgrade SomePackage`` would upgrade `SomePackage` *and*
 `AnotherPackage` despite `AnotherPackage` already being satisifed.
 
-pip doesn't currently have an option to do a non-recursive upgrade, but you
-can achieve it using these 2 steps::
+pip doesn't currently have an option to do an "only if needed" recursive
+upgrade, but you can achieve it using these 2 steps::
 
   pip install --upgrade --no-deps SomePackage
   pip install SomePackage
@@ -396,9 +438,8 @@ The first line will upgrade `SomePackage`, but not dependencies like
 `AnotherPackage`.  The 2nd line will fill in new dependencies like
 `OneMorePackage`.
 
-Finally, to be clear, "non-recursive" in this context does not simply mean
-:ref:`--no-deps <install_--no-deps>`. A non-recursive upgrade will upgrade
-dependencies, but only if needed to fulfill parent requirements.
+See :issue:`59` for a plan of making "only if needed" recursive the default
+behavior for a new ``pip upgrade`` command.
 
 
 User Installs
@@ -516,3 +557,23 @@ Three things are required to fully guarantee a repeatable installation using req
 
 
 .. _PyPI: http://pypi.python.org/pypi/
+
+
+.. _`Installation Bundle`:
+
+Create an Installation Bundle with Compiled Dependencies
+********************************************************
+
+You can create a simple bundle that contains all of the dependencies you wish
+to install using::
+
+    $ tempdir=$(mktemp -d /tmp/wheelhouse-XXXXX)
+    $ pip wheel -r requirements.txt --wheel-dir=$tempdir
+    $ cwd=`pwd`
+    $ (cd "$tempdir"; tar -cjvf "$cwd/bundled.tar.bz2" *)
+
+Once you have a bundle, you can then uninstall it using::
+
+    $ tempdir=$(mktemp -d /tmp/wheelhouse-XXXXX)
+    $ (cd $tempdir; tar -xvf /path/to/bundled.tar.bz2)
+    $ pip install --force-reinstall --ignore-installed --upgrade --no-index --use-wheel --no-deps $tempdir/*

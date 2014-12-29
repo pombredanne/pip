@@ -25,7 +25,7 @@ def test_command_line_options_override_env_vars(script, virtualenv):
     script.environ['PIP_INDEX_URL'] = 'http://b.pypi.python.org/simple/'
     result = script.pip('install', '-vvv', 'INITools', expect_error=True)
     assert (
-        "Getting page http://b.pypi.python.org/simple/INITools"
+        "Getting page http://b.pypi.python.org/simple/initools"
         in result.stdout
     )
     virtualenv.clear()
@@ -141,17 +141,17 @@ def _test_config_file_override_stack(script, virtualenv, config_file):
         """))
     result = script.pip('install', '-vvv', 'INITools', expect_error=True)
     assert (
-        "Getting page http://download.zope.org/ppix/INITools" in result.stdout
+        "Getting page http://download.zope.org/ppix/initools" in result.stdout
     )
     virtualenv.clear()
     (script.scratch_path / config_file).write(textwrap.dedent("""\
         [global]
         index-url = http://download.zope.org/ppix
         [install]
-        index-url = http://pypi.appspot.com/
+        index-url = https://pypi.gocept.com/
         """))
     result = script.pip('install', '-vvv', 'INITools', expect_error=True)
-    assert "Getting page http://pypi.appspot.com/INITools" in result.stdout
+    assert "Getting page https://pypi.gocept.com/initools" in result.stdout
     result = script.pip(
         'install', '-vvv', '--index-url', 'http://pypi.python.org/simple',
         'INITools',
@@ -161,23 +161,10 @@ def _test_config_file_override_stack(script, virtualenv, config_file):
         "Getting page http://download.zope.org/ppix/INITools"
         not in result.stdout
     )
-    assert "Getting page http://pypi.appspot.com/INITools" not in result.stdout
+    assert "Getting page https://pypi.gocept.com/INITools" not in result.stdout
     assert (
-        "Getting page http://pypi.python.org/simple/INITools" in result.stdout
+        "Getting page http://pypi.python.org/simple/initools" in result.stdout
     )
-
-
-def test_log_file_no_directory():
-    """
-    Test opening a log file with no directory name.
-
-    """
-    from pip.basecommand import open_logfile
-    fp = open_logfile('testpip.log')
-    fp.write('can write')
-    fp.close()
-    assert os.path.exists(fp.name)
-    os.remove(fp.name)
 
 
 def test_options_from_venv_config(script, virtualenv):
@@ -185,9 +172,9 @@ def test_options_from_venv_config(script, virtualenv):
     Test if ConfigOptionParser reads a virtualenv-local config file
 
     """
-    from pip.locations import default_config_basename
+    from pip.locations import config_basename
     conf = "[global]\nno-index = true"
-    ini = virtualenv.location / default_config_basename
+    ini = virtualenv.location / config_basename
     with open(ini, 'w') as f:
         f.write(conf)
     result = script.pip('install', '-vvv', 'INITools', expect_error=True)

@@ -1,15 +1,8 @@
+import pytest
+
 from pip.download import PipSession
-from pip.index import package_to_requirement, HTMLPage
+from pip.index import HTMLPage
 from pip.index import PackageFinder, Link, INSTALLED_VERSION
-
-
-def test_package_name_should_be_converted_to_requirement():
-    """
-    Test that it translates a name like Foo-1.2 to Foo==1.3
-    """
-    assert package_to_requirement('Foo-1.2') == 'Foo==1.2'
-    assert package_to_requirement('Foo-dev') == 'Foo==dev'
-    assert package_to_requirement('Foo') == 'Foo'
 
 
 def test_html_page_should_be_able_to_scrap_rel_links():
@@ -17,7 +10,7 @@ def test_html_page_should_be_able_to_scrap_rel_links():
     Test scraping page looking for url in href
     """
     page = HTMLPage(
-        """
+        b"""
 <!-- The <th> elements below are a terrible terrible hack for setuptools -->
 <li>
 <strong>Home Page:</strong>
@@ -65,9 +58,19 @@ class TestLink(object):
     def test_splitext(self):
         assert ('wheel', '.whl') == Link('http://yo/wheel.whl').splitext()
 
-    def test_filename(self):
-        assert 'wheel.whl' == Link('http://yo/wheel.whl').filename
-        assert 'wheel' == Link('http://yo/wheel').filename
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("http://yo/wheel.whl", "wheel.whl"),
+            ("http://yo/wheel", "wheel"),
+            (
+                "http://yo/myproject-1.0%2Bfoobar.0-py2.py3-none-any.whl",
+                "myproject-1.0+foobar.0-py2.py3-none-any.whl",
+            ),
+        ],
+    )
+    def test_filename(self, url, expected):
+        assert Link(url).filename == expected
 
     def test_no_ext(self):
         assert '' == Link('http://yo/wheel').ext
@@ -80,3 +83,53 @@ class TestLink(object):
 
     def test_ext_query(self):
         assert '.whl' == Link('http://yo/wheel.whl?a=b').ext
+
+
+@pytest.mark.parametrize(
+    ("html", "url", "expected"),
+    [
+        ("<html></html>", "https://example.com/", "https://example.com/"),
+        (
+            "<html><head>"
+            "<base href=\"https://foo.example.com/\">"
+            "</head></html>",
+            "https://example.com/",
+            "https://foo.example.com/",
+        ),
+        (
+            "<html><head>"
+            "<base><base href=\"https://foo.example.com/\">"
+            "</head></html>",
+            "https://example.com/",
+            "https://foo.example.com/",
+        ),
+    ],
+)
+def test_base_url(html, url, expected):
+    assert HTMLPage(html, url).base_url == expected
+
+
+class MockLogger(object):
+    def __init__(self):
+        self.called = False
+
+    def warning(self, *args, **kwargs):
+        self.called = True
+
+
+@pytest.mark.parametrize(
+    ("location", "trusted", "expected"),
+    [
+        ("http://pypi.python.org/something", [], True),
+        ("https://pypi.python.org/something", [], False),
+        ("http://localhost", [], False),
+        ("http://127.0.0.1", [], False),
+        ("http://example.com/something/", [], True),
+        ("http://example.com/something/", ["example.com"], False),
+    ],
+)
+def test_secure_origin(location, trusted, expected):
+    finder = PackageFinder([], [], session=[], trusted_hosts=trusted)
+    logger = MockLogger()
+    finder._validate_secure_origin(logger, location)
+    assert logger.called == expected

@@ -29,9 +29,17 @@ and like arguments to :ref:`pip install`, the following forms are supported::
     [-e] <local project path>
     [-e] <vcs project url>
 
+Since version 6.0, pip also supports markers using the "; " separator.
+Examples::
+
+    futures; python_version < '2.7'
+    http://my.package.repo/SomePackage-1.0.4.zip; python_version >= '3.4'
+
 See the :ref:`pip install Examples<pip install Examples>` for examples of all these forms.
 
-A line beginning with ``#`` is treated as a comment and ignored.
+A line that begins with ``#`` is treated as a comment and ignored. Whitespace
+followed by a ``#`` causes the ``#`` and the remainder of the line to be
+treated as a comment.
 
 Additionally, the following Package Index Options are supported:
 
@@ -42,6 +50,7 @@ Additionally, the following Package Index Options are supported:
   *  :ref:`--allow-external <--allow-external>`
   *  :ref:`--allow-all-external <--allow-external>`
   *  :ref:`--allow-unverified <--allow-unverified>`
+  *  :ref:`--no-use-wheel <install_--no-use-wheel>`
 
 For example, to specify :ref:`--no-index <--no-index>` and 2 :ref:`--find-links <--find-links>` locations:
 
@@ -75,8 +84,9 @@ Some Examples:
 
 .. note::
 
-  Use single or double quotes around specifiers to avoid ``>`` and ``<`` being
+  Use single or double quotes around specifiers when using them in a shell to avoid ``>`` and ``<`` being
   interpreted as shell redirects. e.g. ``pip install 'FooProject>=1.2'``.
+  Don't use single or double quotes in a ``requirements.txt`` file.
 
 
 
@@ -152,8 +162,11 @@ the :ref:`--editable <install_--editable>` option) or not.
 * For non-editable installs, the project is built locally in a temp dir and then
   installed normally.
 
-The url suffix "egg=<project name>" is used by pip in its dependency logic to
-identify the project prior to pip downloading and analyzing the metadata.
+The "project name" component of the url suffix "egg=<project name>-<version>"
+is used by pip in its dependency logic to identify the project prior
+to pip downloading and analyzing the metadata.  The optional "version"
+component of the egg name is not functionally important.  It merely
+provides a human-readable clue as to what version is in use.
 
 Git
 ~~~
@@ -254,7 +267,7 @@ of providing secure, certified downloads from PyPI.
 Caching
 +++++++
 
-Starting with v1.6, pip provides an on by default cache which functions
+Starting with v6.0, pip provides an on by default cache which functions
 similarly to that of a web browser. While the cache is on by default and is
 designed do the right thing by default you can disable the cache and always
 access PyPI by utilizing the ``--no-cache-dir`` option.
@@ -443,7 +456,7 @@ Examples
   $ pip install -e hg+https://hg.repo/some_pkg.git#egg=SomePackage            # from mercurial
   $ pip install -e svn+svn://svn.repo/some_pkg/trunk/#egg=SomePackage         # from svn
   $ pip install -e git+https://git.repo/some_pkg.git@feature#egg=SomePackage  # from 'feature' branch
-  $ pip install -e git+https://git.repo/some_repo.git@egg=subdir&subdirectory=subdir_path # install a python package from a repo subdirectory
+  $ pip install -e git+https://git.repo/some_repo.git#egg=subdir&subdirectory=subdir_path # install a python package from a repo subdirectory
 
 6) Install a package with `setuptools extras`_.
 

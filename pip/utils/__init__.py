@@ -1,4 +1,8 @@
+from __future__ import absolute_import
+
+import contextlib
 import locale
+import logging
 import re
 import os
 import posixpath
@@ -10,16 +14,20 @@ import tarfile
 import zipfile
 
 from pip.exceptions import InstallationError, BadCommand
-from pip.compat import(
-    string_types, raw_input, console_to_str, stdlib_pkgs
-)
+from pip.compat import console_to_str, stdlib_pkgs
 from pip.locations import (
     site_packages, user_site, running_under_virtualenv, virtualenv_no_global,
-    write_delete_marker_file
+    write_delete_marker_file,
 )
-from pip.log import logger
-from pip._vendor import pkg_resources
-from pip._vendor.distlib import version
+from pip._vendor import pkg_resources, six
+from pip._vendor.six.moves import input
+from pip._vendor.six.moves import cStringIO
+from pip._vendor.six import PY2
+
+if PY2:
+    from io import BytesIO as StringIO
+else:
+    from io import StringIO
 
 __all__ = ['rmtree', 'display_path', 'backup_dir',
            'find_command', 'ask', 'Inf',
@@ -29,7 +37,11 @@ __all__ = ['rmtree', 'display_path', 'backup_dir',
            'split_leading_dir', 'has_leading_dir',
            'make_path_relative', 'normalize_path',
            'renames', 'get_terminal_size', 'get_prog',
-           'unzip_file', 'untar_file', 'unpack_file', 'call_subprocess']
+           'unzip_file', 'untar_file', 'unpack_file', 'call_subprocess',
+           'captured_stdout', 'remove_tracebacks']
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_prog():
@@ -65,6 +77,9 @@ def display_path(path):
     """Gives the display value for a given path, making it relative to cwd
     if possible."""
     path = os.path.normcase(os.path.abspath(path))
+    if sys.version_info[0] == 2:
+        path = path.decode(sys.getfilesystemencoding(), 'replace')
+        path = path.encode(sys.getdefaultencoding(), 'replace')
     if path.startswith(os.getcwd() + os.path.sep):
         path = '.' + path[len(os.getcwd()):]
     return path
@@ -85,7 +100,7 @@ def find_command(cmd, paths=None, pathext=None):
     """Searches the PATH for the given command and returns its path"""
     if paths is None:
         paths = os.environ.get('PATH', '').split(os.pathsep)
-    if isinstance(paths, string_types):
+    if isinstance(paths, six.string_types):
         paths = [paths]
     # check if there are funny path extensions for executables, e.g. Windows
     if pathext is None:
@@ -131,7 +146,7 @@ def ask(message, options):
                 'No input was expected ($PIP_NO_INPUT set); question: %s' %
                 message
             )
-        response = raw_input(message)
+        response = input(message)
         response = response.strip().lower()
         if response not in options:
             print(
@@ -211,11 +226,8 @@ def is_svn_page(html):
 
 
 def file_contents(filename):
-    fp = open(filename, 'rb')
-    try:
+    with open(filename, 'rb') as fp:
         return fp.read().decode('utf-8')
-    finally:
-        fp.close()
 
 
 def split_leading_dir(path):
@@ -360,7 +372,8 @@ def dist_is_editable(dist):
 def get_installed_distributions(local_only=True,
                                 skip=stdlib_pkgs,
                                 include_editables=True,
-                                editables_only=False):
+                                editables_only=False,
+                                user_only=False):
     """
     Return a list of installed Distribution objects.
 
@@ -373,6 +386,9 @@ def get_installed_distributions(local_only=True,
     If ``editables`` is False, don't report editables.
 
     If ``editables_only`` is True , only report editables.
+
+    If ``user_only`` is True , only report installations in the user
+    site directory.
 
     """
     if local_only:
@@ -390,11 +406,17 @@ def get_installed_distributions(local_only=True,
     else:
         editables_only_test = lambda d: True
 
+    if user_only:
+        user_test = dist_in_usersite
+    else:
+        user_test = lambda d: True
+
     return [d for d in pkg_resources.working_set
             if local_test(d)
             and d.key not in skip
             and editable_test(d)
             and editables_only_test(d)
+            and user_test(d)
             ]
 
 
@@ -465,8 +487,6 @@ def get_terminal_size():
             return None
         if cr == (0, 0):
             return None
-        if cr == (0, 0):
-            return None
         return cr
     cr = ioctl_GWINSZ(0) or ioctl_GWINSZ(1) or ioctl_GWINSZ(2)
     if not cr:
@@ -501,7 +521,7 @@ def unzip_file(filename, location, flatten=True):
         os.makedirs(location)
     zipfp = open(filename, 'rb')
     try:
-        zip = zipfile.ZipFile(zipfp)
+        zip = zipfile.ZipFile(zipfp, allowZip64=True)
         leading = has_leading_dir(zip.namelist()) and flatten
         for info in zip.infolist():
             name = info.filename
@@ -553,7 +573,9 @@ def untar_file(filename, location):
     elif filename.lower().endswith('.tar'):
         mode = 'r'
     else:
-        logger.warn('Cannot determine compression type for file %s' % filename)
+        logger.warning(
+            'Cannot determine compression type for file %s', filename,
+        )
         mode = 'r:*'
     tar = tarfile.open(filename, mode)
     try:
@@ -578,9 +600,10 @@ def untar_file(filename, location):
                 except Exception as exc:
                     # Some corrupt tar files seem to produce this
                     # (specifically bad symlinks)
-                    logger.warn(
-                        'In the tar file %s the member %s is invalid: %s'
-                        % (filename, member.name, exc))
+                    logger.warning(
+                        'In the tar file %s the member %s is invalid: %s',
+                        filename, member.name, exc,
+                    )
                     continue
             else:
                 try:
@@ -588,9 +611,10 @@ def untar_file(filename, location):
                 except (KeyError, AttributeError) as exc:
                     # Some corrupt tar files seem to produce this
                     # (specifically bad symlinks)
-                    logger.warn(
-                        'In the tar file %s the member %s is invalid: %s'
-                        % (filename, member.name, exc))
+                    logger.warning(
+                        'In the tar file %s the member %s is invalid: %s',
+                        filename, member.name, exc,
+                    )
                     continue
                 if not os.path.exists(os.path.dirname(path)):
                     os.makedirs(os.path.dirname(path))
@@ -633,20 +657,31 @@ def unpack_file(filename, location, content_type, link):
     else:
         # FIXME: handle?
         # FIXME: magic signatures?
-        logger.fatal(
+        logger.critical(
             'Cannot unpack file %s (downloaded from %s, content-type: %s); '
-            'cannot detect archive format' %
-            (filename, location, content_type)
+            'cannot detect archive format',
+            filename, location, content_type,
         )
         raise InstallationError(
             'Cannot determine archive format of %s' % location
         )
 
 
+def remove_tracebacks(output):
+    pattern = (r'(?:\W+File "(?:.*)", line (?:.*)\W+(?:.*)\W+\^\W+)?'
+               r'Syntax(?:Error|Warning): (?:.*)')
+    output = re.sub(pattern, '', output)
+    if PY2:
+        return output
+    # compileall.compile_dir() prints different messages to stdout
+    # in Python 3
+    return re.sub(r"\*\*\* Error compiling (?:.*)", '', output)
+
+
 def call_subprocess(cmd, show_stdout=True,
                     filter_stdout=None, cwd=None,
                     raise_on_returncode=True,
-                    command_level=logger.DEBUG, command_desc=None,
+                    command_level=logging.DEBUG, command_desc=None,
                     extra_environ=None):
     if command_desc is None:
         cmd_parts = []
@@ -659,7 +694,7 @@ def call_subprocess(cmd, show_stdout=True,
         stdout = None
     else:
         stdout = subprocess.PIPE
-    logger.log(command_level, "Running command %s" % command_desc)
+    logger.log(command_level, "Running command %s", command_desc)
     env = os.environ.copy()
     if extra_environ:
         env.update(extra_environ)
@@ -668,14 +703,16 @@ def call_subprocess(cmd, show_stdout=True,
             cmd, stderr=subprocess.STDOUT, stdin=None, stdout=stdout,
             cwd=cwd, env=env)
     except Exception as exc:
-        logger.fatal(
-            "Error %s while executing command %s" % (exc, command_desc))
+        logger.critical(
+            "Error %s while executing command %s", exc, command_desc,
+        )
         raise
     all_output = []
     if stdout is not None:
-        stdout = proc.stdout
+        stdout = remove_tracebacks(console_to_str(proc.stdout.read()))
+        stdout = cStringIO(stdout)
         while 1:
-            line = console_to_str(stdout.readline())
+            line = stdout.readline()
             if not line:
                 break
             line = line.rstrip()
@@ -685,10 +722,11 @@ def call_subprocess(cmd, show_stdout=True,
                 if isinstance(level, tuple):
                     level, line = level
                 logger.log(level, line)
-                if not logger.stdout_level_matches(level):
-                    logger.show_progress()
+                # if not logger.stdout_level_matches(level) and False:
+                #     # TODO(dstufft): Handle progress bar.
+                #     logger.show_progress()
             else:
-                logger.info(line)
+                logger.debug(line)
     else:
         returned_stdout, returned_stderr = proc.communicate()
         all_output = [returned_stdout or '']
@@ -696,10 +734,10 @@ def call_subprocess(cmd, show_stdout=True,
     if proc.returncode:
         if raise_on_returncode:
             if all_output:
-                logger.notify(
-                    'Complete output from command %s:' % command_desc
+                logger.info(
+                    'Complete output from command %s:', command_desc,
                 )
-                logger.notify(
+                logger.info(
                     '\n'.join(all_output) +
                     '\n----------------------------------------'
                 )
@@ -707,31 +745,12 @@ def call_subprocess(cmd, show_stdout=True,
                 'Command "%s" failed with error code %s in %s'
                 % (command_desc, proc.returncode, cwd))
         else:
-            logger.warn(
-                'Command "%s" had error code %s in %s'
-                % (command_desc, proc.returncode, cwd))
+            logger.warning(
+                'Command "%s" had error code %s in %s',
+                command_desc, proc.returncode, cwd,
+            )
     if stdout is not None:
-        return ''.join(all_output)
-
-
-def is_prerelease(vers):
-    """
-    Attempt to determine if this is a pre-release using PEP386/PEP426 rules.
-
-    Will return True if it is a pre-release and False if not. Versions are
-    assumed to be a pre-release if they cannot be parsed.
-    """
-    normalized = version._suggest_normalized_version(vers)
-
-    if normalized is None:
-        # Cannot normalize, assume it is a pre-release
-        return True
-
-    parsed = version._normalized_key(normalized)
-    return any([
-        any([y in set(["a", "b", "c", "rc", "dev"]) for y in x])
-        for x in parsed
-    ])
+        return remove_tracebacks(''.join(all_output))
 
 
 def read_text_file(filename):
@@ -780,3 +799,63 @@ class FakeFile(object):
 
     def __iter__(self):
         return self._gen
+
+
+class StreamWrapper(StringIO):
+
+    @classmethod
+    def from_stream(cls, orig_stream):
+        cls.orig_stream = orig_stream
+        return cls()
+
+    # compileall.compile_dir() needs stdout.encoding to print to stdout
+    @property
+    def encoding(self):
+        return self.orig_stream.encoding
+
+
+@contextlib.contextmanager
+def captured_output(stream_name):
+    """Return a context manager used by captured_stdout/stdin/stderr
+    that temporarily replaces the sys stream *stream_name* with a StringIO.
+
+    Taken from Lib/support/__init__.py in the CPython repo.
+    """
+    orig_stdout = getattr(sys, stream_name)
+    setattr(sys, stream_name, StreamWrapper.from_stream(orig_stdout))
+    try:
+        yield getattr(sys, stream_name)
+    finally:
+        setattr(sys, stream_name, orig_stdout)
+
+
+def captured_stdout():
+    """Capture the output of sys.stdout:
+
+       with captured_stdout() as stdout:
+           print('hello')
+       self.assertEqual(stdout.getvalue(), 'hello\n')
+
+    Taken from Lib/support/__init__.py in the CPython repo.
+    """
+    return captured_output('stdout')
+
+
+class cached_property(object):
+    """A property that is only computed once per instance and then replaces
+       itself with an ordinary attribute. Deleting the attribute resets the
+       property.
+
+       Source: https://github.com/bottlepy/bottle/blob/0.11.5/bottle.py#L175
+    """
+
+    def __init__(self, func):
+        self.__doc__ = getattr(func, '__doc__')
+        self.func = func
+
+    def __get__(self, obj, cls):
+        if obj is None:
+            # We're being accessed from the class itself, not from an object
+            return self
+        value = obj.__dict__[self.func.__name__] = self.func(obj)
+        return value

@@ -83,7 +83,7 @@ class Tests_UserSite:
         )
         fspkg_folder = script.user_site / 'fspkg'
         egg_info_folder = (
-            script.user_site / 'FSPkg-0.1dev-py%s.egg-info' % pyversion
+            script.user_site / 'FSPkg-0.1.dev0-py%s.egg-info' % pyversion
         )
         assert fspkg_folder in result.files_created, result.stdout
 
@@ -280,5 +280,5 @@ class Tests_UserSite:
         assert (
             "Will not install to the user site because it will lack sys.path "
             "precedence to %s in %s" %
-            ('INITools', dist_location) in result2.stdout, result2.stdout
-        )
+            ('INITools', dist_location) in result2.stdout
+        ), result2.stdout

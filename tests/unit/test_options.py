@@ -4,7 +4,7 @@ import pip.baseparser
 from pip import main
 from pip import cmdoptions
 from pip.basecommand import Command
-from pip.commands import commands
+from pip.commands import commands_dict as commands
 
 
 class FakeCommand(Command):
@@ -89,10 +89,10 @@ class TestOptionPrecedence(object):
         """
         os.environ['PIP_LOG_FILE'] = 'override.log'
         options, args = main(['fake'])
-        assert options.log_file == 'override.log'
+        assert options.log == 'override.log'
         os.environ['PIP_LOCAL_LOG'] = 'override.log'
         options, args = main(['fake'])
-        assert options.log_file == 'override.log'
+        assert options.log == 'override.log'
 
     def test_cli_override_environment(self):
         """
@@ -210,7 +210,7 @@ class TestGeneralOptions(object):
     def test_local_log(self):
         options1, args1 = main(['--local-log', 'path', 'fake'])
         options2, args2 = main(['fake', '--local-log', 'path'])
-        assert options1.log_file == options2.log_file == 'path'
+        assert options1.log == options2.log == 'path'
 
     def test_no_input(self):
         options1, args1 = main(['--no-input', 'fake'])
@@ -259,11 +259,6 @@ class TestGeneralOptions(object):
         options2, args2 = main(['fake', '--client-cert', 'path'])
         assert options1.client_cert == options2.client_cert == 'path'
 
-    def test_no_check_certificate(self):
-        options1, args1 = main(['--no-check-certificate', 'fake'])
-        options2, args2 = main(['fake', '--no-check-certificate'])
-        assert options1.no_check_certificate == options2.no_check_certificate
-
 
 class TestOptionsConfigFiles(object):
 
@@ -275,6 +270,9 @@ class TestOptionsConfigFiles(object):
             lambda self: None,
         )
 
+        # strict limit on the site_config_files list
+        monkeypatch.setattr(pip.baseparser, 'site_config_files', ['/a/place'])
+
         # If we are running in a virtualenv and all files appear to exist,
         # we should see two config files.
         monkeypatch.setattr(
@@ -284,4 +282,4 @@ class TestOptionsConfigFiles(object):
         )
         monkeypatch.setattr(os.path, 'exists', lambda filename: True)
         cp = pip.baseparser.ConfigOptionParser()
-        assert len(cp.get_config_files()) == 2
+        assert len(cp.get_config_files()) == 4

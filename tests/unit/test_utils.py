@@ -12,9 +12,9 @@ import pytest
 
 from mock import Mock, patch
 from pip.exceptions import BadCommand
-from pip.util import (egg_link_path, Inf, get_installed_distributions,
-                      find_command, untar_file, unzip_file)
-from pip.commands.freeze import freeze_excludes
+from pip.utils import (egg_link_path, Inf, get_installed_distributions,
+                       find_command, untar_file, unzip_file)
+from pip.operations.freeze import freeze_excludes
 
 
 class Tests_EgglinkPath:
@@ -37,26 +37,26 @@ class Tests_EgglinkPath:
         )
 
         # patches
-        from pip import util
-        self.old_site_packages = util.site_packages
-        self.mock_site_packages = util.site_packages = 'SITE_PACKAGES'
-        self.old_running_under_virtualenv = util.running_under_virtualenv
-        self.mock_running_under_virtualenv = util.running_under_virtualenv = \
+        from pip import utils
+        self.old_site_packages = utils.site_packages
+        self.mock_site_packages = utils.site_packages = 'SITE_PACKAGES'
+        self.old_running_under_virtualenv = utils.running_under_virtualenv
+        self.mock_running_under_virtualenv = utils.running_under_virtualenv = \
             Mock()
-        self.old_virtualenv_no_global = util.virtualenv_no_global
-        self.mock_virtualenv_no_global = util.virtualenv_no_global = Mock()
-        self.old_user_site = util.user_site
-        self.mock_user_site = util.user_site = self.user_site
+        self.old_virtualenv_no_global = utils.virtualenv_no_global
+        self.mock_virtualenv_no_global = utils.virtualenv_no_global = Mock()
+        self.old_user_site = utils.user_site
+        self.mock_user_site = utils.user_site = self.user_site
         from os import path
         self.old_isfile = path.isfile
         self.mock_isfile = path.isfile = Mock()
 
     def teardown(self):
-        from pip import util
-        util.site_packages = self.old_site_packages
-        util.running_under_virtualenv = self.old_running_under_virtualenv
-        util.virtualenv_no_global = self.old_virtualenv_no_global
-        util.user_site = self.old_user_site
+        from pip import utils
+        utils.site_packages = self.old_site_packages
+        utils.running_under_virtualenv = self.old_running_under_virtualenv
+        utils.virtualenv_no_global = self.old_virtualenv_no_global
+        utils.user_site = self.old_user_site
         from os import path
         path.isfile = self.old_isfile
 
@@ -161,8 +161,9 @@ def test_Inf_equals_Inf():
     assert Inf == Inf
 
 
-@patch('pip.util.dist_is_local')
-@patch('pip.util.dist_is_editable')
+@patch('pip.utils.dist_in_usersite')
+@patch('pip.utils.dist_is_local')
+@patch('pip.utils.dist_is_editable')
 class Tests_get_installed_distributions:
     """test util.get_installed_distributions"""
 
@@ -170,6 +171,7 @@ class Tests_get_installed_distributions:
         Mock(test_name="global"),
         Mock(test_name="editable"),
         Mock(test_name="normal"),
+        Mock(test_name="user"),
     ]
 
     workingset_stdlib = [
@@ -187,37 +189,63 @@ class Tests_get_installed_distributions:
         return dist.test_name == "editable"
 
     def dist_is_local(self, dist):
-        return dist.test_name != "global"
+        return dist.test_name != "global" and dist.test_name != 'user'
+
+    def dist_in_usersite(self, dist):
+        return dist.test_name == "user"
 
     @patch('pip._vendor.pkg_resources.working_set', workingset)
-    def test_editables_only(self, mock_dist_is_editable, mock_dist_is_local):
+    def test_editables_only(self, mock_dist_is_editable,
+                            mock_dist_is_local,
+                            mock_dist_in_usersite):
         mock_dist_is_editable.side_effect = self.dist_is_editable
         mock_dist_is_local.side_effect = self.dist_is_local
+        mock_dist_in_usersite.side_effect = self.dist_in_usersite
         dists = get_installed_distributions(editables_only=True)
         assert len(dists) == 1, dists
         assert dists[0].test_name == "editable"
 
     @patch('pip._vendor.pkg_resources.working_set', workingset)
-    def test_exclude_editables(
-            self, mock_dist_is_editable, mock_dist_is_local):
+    def test_exclude_editables(self, mock_dist_is_editable,
+                               mock_dist_is_local,
+                               mock_dist_in_usersite):
         mock_dist_is_editable.side_effect = self.dist_is_editable
         mock_dist_is_local.side_effect = self.dist_is_local
+        mock_dist_in_usersite.side_effect = self.dist_in_usersite
         dists = get_installed_distributions(include_editables=False)
         assert len(dists) == 1
         assert dists[0].test_name == "normal"
 
     @patch('pip._vendor.pkg_resources.working_set', workingset)
-    def test_include_globals(self, mock_dist_is_editable, mock_dist_is_local):
+    def test_include_globals(self, mock_dist_is_editable,
+                             mock_dist_is_local,
+                             mock_dist_in_usersite):
         mock_dist_is_editable.side_effect = self.dist_is_editable
         mock_dist_is_local.side_effect = self.dist_is_local
+        mock_dist_in_usersite.side_effect = self.dist_in_usersite
         dists = get_installed_distributions(local_only=False)
-        assert len(dists) == 3
+        assert len(dists) == 4
+
+    @patch('pip._vendor.pkg_resources.working_set', workingset)
+    def test_user_only(self, mock_dist_is_editable,
+                       mock_dist_is_local,
+                       mock_dist_in_usersite):
+        mock_dist_is_editable.side_effect = self.dist_is_editable
+        mock_dist_is_local.side_effect = self.dist_is_local
+        mock_dist_in_usersite.side_effect = self.dist_in_usersite
+        dists = get_installed_distributions(local_only=False,
+                                            user_only=True)
+        assert len(dists) == 1
+        assert dists[0].test_name == "user"
 
     @pytest.mark.skipif("sys.version_info >= (2,7)")
     @patch('pip._vendor.pkg_resources.working_set', workingset_stdlib)
-    def test_py26_excludes(self, mock_dist_is_editable, mock_dist_is_local):
+    def test_py26_excludes(self, mock_dist_is_editable,
+                           mock_dist_is_local,
+                           mock_dist_in_usersite):
         mock_dist_is_editable.side_effect = self.dist_is_editable
         mock_dist_is_local.side_effect = self.dist_is_local
+        mock_dist_in_usersite.side_effect = self.dist_in_usersite
         dists = get_installed_distributions()
         assert len(dists) == 1
         assert dists[0].key == 'argparse'
@@ -225,31 +253,36 @@ class Tests_get_installed_distributions:
     @pytest.mark.skipif("sys.version_info < (2,7)")
     @patch('pip._vendor.pkg_resources.working_set', workingset_stdlib)
     def test_gte_py27_excludes(self, mock_dist_is_editable,
-                               mock_dist_is_local):
+                               mock_dist_is_local,
+                               mock_dist_in_usersite):
         mock_dist_is_editable.side_effect = self.dist_is_editable
         mock_dist_is_local.side_effect = self.dist_is_local
+        mock_dist_in_usersite.side_effect = self.dist_in_usersite
         dists = get_installed_distributions()
         assert len(dists) == 0
 
     @patch('pip._vendor.pkg_resources.working_set', workingset_freeze)
-    def test_freeze_excludes(self, mock_dist_is_editable, mock_dist_is_local):
+    def test_freeze_excludes(self, mock_dist_is_editable,
+                             mock_dist_is_local,
+                             mock_dist_in_usersite):
         mock_dist_is_editable.side_effect = self.dist_is_editable
         mock_dist_is_local.side_effect = self.dist_is_local
+        mock_dist_in_usersite.side_effect = self.dist_in_usersite
         dists = get_installed_distributions(skip=freeze_excludes)
         assert len(dists) == 0
 
 
-def test_find_command_folder_in_path(script):
+def test_find_command_folder_in_path(tmpdir):
     """
     If a folder named e.g. 'git' is in PATH, and find_command is looking for
     the 'git' executable, it should not match the folder, but rather keep
     looking.
     """
-    script.scratch_path.join("path_one").mkdir()
-    path_one = script.scratch_path / 'path_one'
+    tmpdir.join("path_one").mkdir()
+    path_one = tmpdir / 'path_one'
     path_one.join("foo").mkdir()
-    script.scratch_path.join("path_two").mkdir()
-    path_two = script.scratch_path / 'path_two'
+    tmpdir.join("path_two").mkdir()
+    path_two = tmpdir / 'path_two'
     path_two.join("foo").write("# nothing")
     found_path = find_command('foo', map(str, [path_one, path_two]))
     assert found_path == path_two / 'foo'
@@ -274,7 +307,7 @@ def test_does_not_find_command_because_there_is_no_path():
 
 
 @patch('os.pathsep', ':')
-@patch('pip.util.get_pathext')
+@patch('pip.utils.get_pathext')
 @patch('os.path.isfile')
 def test_find_command_trys_all_pathext(mock_isfile, getpath_mock):
     """
@@ -294,14 +327,13 @@ def test_find_command_trys_all_pathext(mock_isfile, getpath_mock):
         find_command("foo", "path_one")
 
     assert (
-        mock_isfile.call_args_list == expected, "Actual: %s\nExpected %s" %
-        (mock_isfile.call_args_list, expected)
-    )
+        mock_isfile.call_args_list == expected
+    ), "Actual: %s\nExpected %s" % (mock_isfile.call_args_list, expected)
     assert getpath_mock.called, "Should call get_pathext"
 
 
 @patch('os.pathsep', ':')
-@patch('pip.util.get_pathext')
+@patch('pip.utils.get_pathext')
 @patch('os.path.isfile')
 def test_find_command_trys_supplied_pathext(mock_isfile, getpath_mock):
     """
@@ -320,11 +352,9 @@ def test_find_command_trys_supplied_pathext(mock_isfile, getpath_mock):
 
     with pytest.raises(BadCommand):
         find_command("foo", "path_one", pathext)
-
     assert (
-        mock_isfile.call_args_list == expected, "Actual: %s\nExpected %s" %
-        (mock_isfile.call_args_list, expected)
-    )
+        mock_isfile.call_args_list == expected
+    ), "Actual: %s\nExpected %s" % (mock_isfile.call_args_list, expected)
     assert not getpath_mock.called, "Should not call get_pathext"
 
 

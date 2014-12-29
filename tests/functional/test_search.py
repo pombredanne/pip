@@ -1,9 +1,7 @@
-from pip.commands.search import (compare_versions,
-                                 highest_version,
+from pip.commands.search import (highest_version,
                                  transform_hits,
                                  SearchCommand)
 from pip.status_codes import NO_MATCHES_FOUND, SUCCESS
-from mock import Mock
 from tests.lib import pyversion
 
 
@@ -18,10 +16,6 @@ def test_version_compare():
     Test version comparison.
 
     """
-    assert compare_versions('1.0', '1.1') == -1
-    assert compare_versions('1.1', '1.0') == 1
-    assert compare_versions('1.1a1', '1.1') == -1
-    assert compare_versions('1.1.1', '1.1a') == -1
     assert highest_version(['1.0', '2.0', '0.1']) == '2.0'
     assert highest_version(['1.0a1', '1.0']) == '1.0'
 
@@ -139,10 +133,10 @@ def test_run_method_should_return_sucess_when_find_packages():
     """
     Test SearchCommand.run for found package
     """
-    options_mock = Mock()
-    options_mock.index = 'http://pypi.python.org/pypi'
-    search_cmd = SearchCommand()
-    status = search_cmd.run(options_mock, ('pip',))
+    command = SearchCommand()
+    cmdline = "--index=http://pypi.python.org/pypi pip"
+    options, args = command.parse_args(cmdline.split())
+    status = command.run(options, args)
     assert status == SUCCESS
 
 
@@ -150,11 +144,11 @@ def test_run_method_should_return_no_matches_found_when_does_not_find_pkgs():
     """
     Test SearchCommand.run for no matches
     """
-    options_mock = Mock()
-    options_mock.index = 'https://pypi.python.org/pypi'
-    search_cmd = SearchCommand()
-    status = search_cmd.run(options_mock, ('non-existent-package',))
-    assert status == NO_MATCHES_FOUND, status
+    command = SearchCommand()
+    cmdline = "--index=http://pypi.python.org/pypi non-existent-package"
+    options, args = command.parse_args(cmdline.split())
+    status = command.run(options, args)
+    assert status == NO_MATCHES_FOUND
 
 
 def test_search_should_exit_status_code_zero_when_find_packages(script):
