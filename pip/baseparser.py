@@ -1,19 +1,30 @@
 """Base option parser setup"""
+from __future__ import absolute_import
 
 import sys
 import optparse
-import pkg_resources
 import os
+import re
+import textwrap
 from distutils.util import strtobool
-from pip.backwardcompat import ConfigParser, string_types
-from pip.locations import default_config_file, default_log_file
-from pip.util import get_terminal_size, get_prog
+
+from pip._vendor.six import string_types
+from pip._vendor.six.moves import configparser
+from pip.locations import (
+    legacy_config_file, config_basename, running_under_virtualenv,
+    site_config_files
+)
+from pip.utils import appdirs, get_terminal_size
+
+
+_environ_prefix_re = re.compile(r"^PIP_", re.I)
 
 
 class PrettyHelpFormatter(optparse.IndentedHelpFormatter):
     """A prettier/less verbose help formatter for optparse."""
 
     def __init__(self, *args, **kwargs):
+        # help position must be aligned with __init__.parseopts.description
         kwargs['max_help_position'] = 30
         kwargs['indent_increment'] = 1
         kwargs['width'] = get_terminal_size()[0] - 2
@@ -41,7 +52,7 @@ class PrettyHelpFormatter(optparse.IndentedHelpFormatter):
 
         if option.takes_value():
             metavar = option.metavar or option.dest.lower()
-            opts.append(mvarfmt % metavar.upper())
+            opts.append(mvarfmt % metavar.lower())
 
         return ''.join(opts)
 
@@ -52,17 +63,26 @@ class PrettyHelpFormatter(optparse.IndentedHelpFormatter):
 
     def format_usage(self, usage):
         """
-        ensure there is only one newline between usage and the first heading
-        if there is no description
+        Ensure there is only one newline between usage and the first heading
+        if there is no description.
         """
-        msg = 'Usage: %s' % usage
-        if self.parser.description:
-            msg += '\n'
+        msg = '\nUsage: %s\n' % self.indent_lines(textwrap.dedent(usage), "  ")
         return msg
 
     def format_description(self, description):
         # leave full control over description to us
         if description:
+            if hasattr(self.parser, 'main'):
+                label = 'Commands'
+            else:
+                label = 'Description'
+            # some doc strings have initial newlines, some don't
+            description = description.lstrip('\n')
+            # some doc strings have final newlines and spaces, some don't
+            description = description.rstrip()
+            # dedent, then reindent
+            description = self.indent_lines(textwrap.dedent(description), "  ")
+            description = '%s:\n%s\n' % (label, description)
             return description
         else:
             return ''
@@ -74,37 +94,109 @@ class PrettyHelpFormatter(optparse.IndentedHelpFormatter):
         else:
             return ''
 
+    def indent_lines(self, text, indent):
+        new_lines = [indent + line for line in text.split('\n')]
+        return "\n".join(new_lines)
+
 
 class UpdatingDefaultsHelpFormatter(PrettyHelpFormatter):
-    """Custom help formatter for use in ConfigOptionParser that updates
-    the defaults before expanding them, allowing them to show up correctly
-    in the help listing"""
+    """Custom help formatter for use in ConfigOptionParser.
+
+    This is updates the defaults before expanding them, allowing
+    them to show up correctly in the help listing.
+    """
 
     def expand_default(self, option):
         if self.parser is not None:
-            self.parser.update_defaults(self.parser.defaults)
+            self.parser._update_defaults(self.parser.defaults)
         return optparse.IndentedHelpFormatter.expand_default(self, option)
 
 
-class ConfigOptionParser(optparse.OptionParser):
-    """Custom option parser which updates its defaults by by checking the
+class CustomOptionParser(optparse.OptionParser):
+
+    def insert_option_group(self, idx, *args, **kwargs):
+        """Insert an OptionGroup at a given position."""
+        group = self.add_option_group(*args, **kwargs)
+
+        self.option_groups.pop()
+        self.option_groups.insert(idx, group)
+
+        return group
+
+    @property
+    def option_list_all(self):
+        """Get a list of all options, including those in option groups."""
+        res = self.option_list[:]
+        for i in self.option_groups:
+            res.extend(i.option_list)
+
+        return res
+
+
+class ConfigOptionParser(CustomOptionParser):
+    """Custom option parser which updates its defaults by checking the
     configuration files and environmental variables"""
 
+    isolated = False
+
     def __init__(self, *args, **kwargs):
-        self.config = ConfigParser.RawConfigParser()
+        self.config = configparser.RawConfigParser()
         self.name = kwargs.pop('name')
+        self.isolated = kwargs.pop("isolated", False)
         self.files = self.get_config_files()
-        self.config.read(self.files)
+        if self.files:
+            self.config.read(self.files)
         assert self.name
         optparse.OptionParser.__init__(self, *args, **kwargs)
 
     def get_config_files(self):
+        # the files returned by this method will be parsed in order with the
+        # first files listed being overridden by later files in standard
+        # ConfigParser fashion
         config_file = os.environ.get('PIP_CONFIG_FILE', False)
-        if config_file and os.path.exists(config_file):
-            return [config_file]
-        return [default_config_file]
+        if config_file == os.devnull:
+            return []
 
-    def update_defaults(self, defaults):
+        # at the base we have any site-wide configuration
+        files = list(site_config_files)
+
+        # per-user configuration next
+        if not self.isolated:
+            if config_file and os.path.exists(config_file):
+                files.append(config_file)
+            else:
+                # This is the legacy config file, we consider it to be a lower
+                # priority than the new file location.
+                files.append(legacy_config_file)
+
+                # This is the new config file, we consider it to be a higher
+                # priority than the legacy file.
+                files.append(
+                    os.path.join(
+                        appdirs.user_config_dir("pip"),
+                        config_basename,
+                    )
+                )
+
+        # finally virtualenv configuration first trumping others
+        if running_under_virtualenv():
+            venv_config_file = os.path.join(
+                sys.prefix,
+                config_basename,
+            )
+            if os.path.exists(venv_config_file):
+                files.append(venv_config_file)
+
+        return files
+
+    def check_default(self, option, key, val):
+        try:
+            return option.check_value(key, val)
+        except optparse.OptionValueError as exc:
+            print("An error occurred during configuration: %s" % exc)
+            sys.exit(3)
+
+    def _update_defaults(self, defaults):
         """Updates the given defaults with values from the config files and
         the environ. Does a little special handling for certain types of
         options (lists)."""
@@ -112,30 +204,49 @@ class ConfigOptionParser(optparse.OptionParser):
         config = {}
         # 1. config files
         for section in ('global', self.name):
-            config.update(self.normalize_keys(self.get_config_section(section)))
+            config.update(
+                self.normalize_keys(self.get_config_section(section))
+            )
         # 2. environmental variables
-        config.update(self.normalize_keys(self.get_environ_vars()))
+        if not self.isolated:
+            config.update(self.normalize_keys(self.get_environ_vars()))
+        # Accumulate complex default state.
+        self.values = optparse.Values(self.defaults)
+        late_eval = set()
         # Then set the options with those values
         for key, val in config.items():
+            # ignore empty values
+            if not val:
+                continue
+
             option = self.get_option(key)
-            if option is not None:
-                # ignore empty values
-                if not val:
-                    continue
-                # handle multiline configs
-                if option.action == 'append':
-                    val = val.split()
-                else:
-                    option.nargs = 1
-                if option.action in ('store_true', 'store_false', 'count'):
-                    val = strtobool(val)
-                try:
-                    val = option.convert_value(key, val)
-                except optparse.OptionValueError:
-                    e = sys.exc_info()[1]
-                    print("An error occured during configuration: %s" % e)
-                    sys.exit(3)
-                defaults[option.dest] = val
+            # Ignore options not present in this parser. E.g. non-globals put
+            # in [global] by users that want them to apply to all applicable
+            # commands.
+            if option is None:
+                continue
+
+            if option.action in ('store_true', 'store_false', 'count'):
+                val = strtobool(val)
+            elif option.action == 'append':
+                val = val.split()
+                val = [self.check_default(option, key, v) for v in val]
+            elif option.action == 'callback':
+                late_eval.add(option.dest)
+                opt_str = option.get_opt_string()
+                val = option.convert_value(opt_str, val)
+                # From take_action
+                args = option.callback_args or ()
+                kwargs = option.callback_kwargs or {}
+                option.callback(option, opt_str, val, self, *args, **kwargs)
+            else:
+                val = self.check_default(option, key, val)
+
+            defaults[option.dest] = val
+
+        for key in late_eval:
+            defaults[key] = getattr(self.values, key)
+        self.values = None
         return defaults
 
     def normalize_keys(self, items):
@@ -156,20 +267,20 @@ class ConfigOptionParser(optparse.OptionParser):
             return self.config.items(name)
         return []
 
-    def get_environ_vars(self, prefix='PIP_'):
+    def get_environ_vars(self):
         """Returns a generator with all environmental vars with prefix PIP_"""
         for key, val in os.environ.items():
-            if key.startswith(prefix):
-                yield (key.replace(prefix, '').lower(), val)
+            if _environ_prefix_re.search(key):
+                yield (_environ_prefix_re.sub("", key).lower(), val)
 
     def get_default_values(self):
-        """Overridding to make updating the defaults after instantiation of
-        the option parser possible, update_defaults() does the dirty work."""
+        """Overriding to make updating the defaults after instantiation of
+        the option parser possible, _update_defaults() does the dirty work."""
         if not self.process_default_values:
             # Old, pre-Optik 1.5 behaviour.
             return optparse.Values(self.defaults)
 
-        defaults = self.update_defaults(self.defaults.copy())  # ours
+        defaults = self._update_defaults(self.defaults.copy())  # ours
         for option in self._get_all_options():
             default = defaults.get(option.dest)
             if isinstance(default, string_types):
@@ -180,120 +291,3 @@ class ConfigOptionParser(optparse.OptionParser):
     def error(self, msg):
         self.print_usage(sys.stderr)
         self.exit(2, "%s\n" % msg)
-
-
-try:
-    pip_dist = pkg_resources.get_distribution('pip')
-    version = '%s from %s (python %s)' % (
-        pip_dist, pip_dist.location, sys.version[:3])
-except pkg_resources.DistributionNotFound:
-    # when running pip.py without installing
-    version = None
-
-
-parser = ConfigOptionParser(
-    usage='%prog COMMAND [OPTIONS]',
-    version=version,
-    add_help_option=False,
-    formatter=UpdatingDefaultsHelpFormatter(),
-    name='global',
-    prog=get_prog())
-
-parser.add_option(
-    '-h', '--help',
-    dest='help',
-    action='store_true',
-    help='Show help')
-parser.add_option(
-    # Run only if inside a virtualenv, bail if not.
-    '--require-virtualenv', '--require-venv',
-    dest='require_venv',
-    action='store_true',
-    default=False,
-    help=optparse.SUPPRESS_HELP)
-
-parser.add_option(
-    '-v', '--verbose',
-    dest='verbose',
-    action='count',
-    default=0,
-    help='Give more output')
-parser.add_option(
-    '-q', '--quiet',
-    dest='quiet',
-    action='count',
-    default=0,
-    help='Give less output')
-parser.add_option(
-    '--log',
-    dest='log',
-    metavar='FILENAME',
-    help='Log file where a complete (maximum verbosity) record will be kept')
-parser.add_option(
-    # Writes the log levels explicitely to the log'
-    '--log-explicit-levels',
-    dest='log_explicit_levels',
-    action='store_true',
-    default=False,
-    help=optparse.SUPPRESS_HELP)
-parser.add_option(
-    # The default log file
-    '--local-log', '--log-file',
-    dest='log_file',
-    metavar='FILENAME',
-    default=default_log_file,
-    help=optparse.SUPPRESS_HELP)
-parser.add_option(
-    # Don't ask for input
-    '--no-input',
-    dest='no_input',
-    action='store_true',
-    default=False,
-    help=optparse.SUPPRESS_HELP)
-
-parser.add_option(
-    '--proxy',
-    dest='proxy',
-    type='str',
-    default='',
-    help="Specify a proxy in the form user:passwd@proxy.server:port. "
-    "Note that the user:password@ is optional and required only if you "
-    "are behind an authenticated proxy. If you provide "
-    "user@proxy.server:port then you will be prompted for a password.")
-parser.add_option(
-    '--timeout', '--default-timeout',
-    metavar='SECONDS',
-    dest='timeout',
-    type='float',
-    default=15,
-    help='Set the socket timeout (default %default seconds)')
-parser.add_option(
-    # The default version control system for editables, e.g. 'svn'
-    '--default-vcs',
-    dest='default_vcs',
-    type='str',
-    default='',
-    help=optparse.SUPPRESS_HELP)
-parser.add_option(
-    # A regex to be used to skip requirements
-    '--skip-requirements-regex',
-    dest='skip_requirements_regex',
-    type='str',
-    default='',
-    help=optparse.SUPPRESS_HELP)
-
-parser.add_option(
-    # Option when path already exist
-    '--exists-action',
-    dest='exists_action',
-    type='choice',
-    choices=['s', 'i', 'w', 'b'],
-    default=[],
-    action='append',
-    help="Default action when a path already exists. "
-         "Use this option more than one time to specify "
-         "another action if a certain option is not "
-         "available. Choices: "
-         "(s)witch, (i)gnore, (w)ipe, (b)ackup")
-
-parser.disable_interspersed_args()

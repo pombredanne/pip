@@ -1,290 +1,437 @@
+from __future__ import absolute_import
+
+import logging
+import operator
 import os
-import sys
 import tempfile
 import shutil
-from pip.req import InstallRequirement, RequirementSet
-from pip.req import parse_requirements
-from pip.log import logger
-from pip.locations import build_prefix, src_prefix, virtualenv_no_global
-from pip.basecommand import Command
-from pip.index import PackageFinder
-from pip.exceptions import InstallationError, CommandError
-from pip.backwardcompat import home_lib
+import warnings
+try:
+    import wheel
+except ImportError:
+    wheel = None
+
+from pip.req import RequirementSet
+from pip.basecommand import RequirementCommand
+from pip.locations import virtualenv_no_global, distutils_scheme
+from pip.exceptions import (
+    InstallationError, CommandError, PreviousBuildDirError,
+)
+from pip import cmdoptions
+from pip.utils import ensure_dir, get_installed_version
+from pip.utils.build import BuildDirectory
+from pip.utils.deprecation import RemovedInPip10Warning
+from pip.utils.filesystem import check_path_owner
+from pip.wheel import WheelCache, WheelBuilder
 
 
-class InstallCommand(Command):
+logger = logging.getLogger(__name__)
+
+
+class InstallCommand(RequirementCommand):
+    """
+    Install packages from:
+
+    - PyPI (and other indexes) using requirement specifiers.
+    - VCS project urls.
+    - Local project directories.
+    - Local or remote source archives.
+
+    pip also supports installing from "requirements files", which provide
+    an easy way to specify a whole environment to be installed.
+    """
     name = 'install'
-    usage = '%prog [OPTIONS] PACKAGE_NAMES...'
-    summary = 'Install packages'
-    bundle = False
 
-    def __init__(self):
-        super(InstallCommand, self).__init__()
-        self.parser.add_option(
-            '-e', '--editable',
-            dest='editables',
-            action='append',
-            default=[],
-            metavar='VCS+REPOS_URL[@REV]#egg=PACKAGE',
-            help='Install a package directly from a checkout. Source will be checked '
-            'out into src/PACKAGE (lower-case) and installed in-place (using '
-            'setup.py develop). You can run this on an existing directory/checkout (like '
-            'pip install -e src/mycheckout). This option may be provided multiple times. '
-            'Possible values for VCS are: svn, git, hg and bzr.')
-        self.parser.add_option(
-            '-r', '--requirement',
-            dest='requirements',
-            action='append',
-            default=[],
-            metavar='FILENAME',
-            help='Install all the packages listed in the given requirements file. '
-            'This option can be used multiple times.')
-        self.parser.add_option(
-            '-f', '--find-links',
-            dest='find_links',
-            action='append',
-            default=[],
-            metavar='URL',
-            help='URL to look for packages at')
-        self.parser.add_option(
-            '-i', '--index-url', '--pypi-url',
-            dest='index_url',
-            metavar='URL',
-            default='http://pypi.python.org/simple/',
-            help='Base URL of Python Package Index (default %default)')
-        self.parser.add_option(
-            '--extra-index-url',
-            dest='extra_index_urls',
-            metavar='URL',
-            action='append',
-            default=[],
-            help='Extra URLs of package indexes to use in addition to --index-url')
-        self.parser.add_option(
-            '--no-index',
-            dest='no_index',
-            action='store_true',
-            default=False,
-            help='Ignore package index (only looking at --find-links URLs instead)')
-        self.parser.add_option(
-            '-M', '--use-mirrors',
-            dest='use_mirrors',
-            action='store_true',
-            default=False,
-            help='Use the PyPI mirrors as a fallback in case the main index is down.')
-        self.parser.add_option(
-            '--mirrors',
-            dest='mirrors',
-            metavar='URL',
-            action='append',
-            default=[],
-            help='Specific mirror URLs to query when --use-mirrors is used')
+    usage = """
+      %prog [options] <requirement specifier> [package-index-options] ...
+      %prog [options] -r <requirements file> [package-index-options] ...
+      %prog [options] [-e] <vcs project url> ...
+      %prog [options] [-e] <local project path> ...
+      %prog [options] <archive url/path> ..."""
 
-        self.parser.add_option(
-            '-b', '--build', '--build-dir', '--build-directory',
-            dest='build_dir',
-            metavar='DIR',
-            default=build_prefix,
-            help='Unpack packages into DIR (default %default) and build from there')
-        self.parser.add_option(
+    summary = 'Install packages.'
+
+    def __init__(self, *args, **kw):
+        super(InstallCommand, self).__init__(*args, **kw)
+
+        cmd_opts = self.cmd_opts
+
+        cmd_opts.add_option(cmdoptions.constraints())
+        cmd_opts.add_option(cmdoptions.editable())
+        cmd_opts.add_option(cmdoptions.requirements())
+        cmd_opts.add_option(cmdoptions.build_dir())
+
+        cmd_opts.add_option(
             '-t', '--target',
             dest='target_dir',
-            metavar='DIR',
+            metavar='dir',
             default=None,
-            help='Install packages into DIR.')
-        self.parser.add_option(
+            help='Install packages into <dir>. '
+                 'By default this will not replace existing files/folders in '
+                 '<dir>. Use --upgrade to replace existing packages in <dir> '
+                 'with new versions.'
+        )
+
+        cmd_opts.add_option(
             '-d', '--download', '--download-dir', '--download-directory',
             dest='download_dir',
-            metavar='DIR',
+            metavar='dir',
             default=None,
-            help='Download packages into DIR instead of installing them')
-        self.parser.add_option(
-            '--download-cache',
-            dest='download_cache',
-            metavar='DIR',
-            default=None,
-            help='Cache downloaded packages in DIR')
-        self.parser.add_option(
-            '--src', '--source', '--source-dir', '--source-directory',
-            dest='src_dir',
-            metavar='DIR',
-            default=src_prefix,
-            help='Check out --editable packages into DIR (default %default)')
+            help=("Download packages into <dir> instead of installing them, "
+                  "regardless of what's already installed."),
+        )
 
-        self.parser.add_option(
+        cmd_opts.add_option(cmdoptions.src())
+
+        cmd_opts.add_option(
             '-U', '--upgrade',
             dest='upgrade',
             action='store_true',
-            help='Upgrade all packages to the newest available version')
-        self.parser.add_option(
+            help='Upgrade all specified packages to the newest available '
+                 'version. The handling of dependencies depends on the '
+                 'upgrade-strategy used.'
+        )
+
+        cmd_opts.add_option(
+            '--upgrade-strategy',
+            dest='upgrade_strategy',
+            default='eager',
+            choices=['only-if-needed', 'eager'],
+            help='Determines how dependency upgrading should be handled. '
+                 '"eager" - dependencies are upgraded regardless of '
+                 'whether the currently installed version satisfies the '
+                 'requirements of the upgraded package(s). '
+                 '"only-if-needed" -  are upgraded only when they do not '
+                 'satisfy the requirements of the upgraded package(s).'
+        )
+
+        cmd_opts.add_option(
             '--force-reinstall',
             dest='force_reinstall',
             action='store_true',
             help='When upgrading, reinstall all packages even if they are '
                  'already up-to-date.')
-        self.parser.add_option(
+
+        cmd_opts.add_option(
             '-I', '--ignore-installed',
             dest='ignore_installed',
             action='store_true',
-            help='Ignore the installed packages (reinstalling instead)')
-        self.parser.add_option(
-            '--no-deps', '--no-dependencies',
-            dest='ignore_dependencies',
-            action='store_true',
-            default=False,
-            help='Ignore package dependencies')
-        self.parser.add_option(
-            '--no-install',
-            dest='no_install',
-            action='store_true',
-            help="Download and unpack all packages, but don't actually install them")
-        self.parser.add_option(
-            '--no-download',
-            dest='no_download',
-            action="store_true",
-            help="Don't download any packages, just install the ones already downloaded "
-            "(completes an install run with --no-install)")
+            help='Ignore the installed packages (reinstalling instead).')
 
-        self.parser.add_option(
-            '--install-option',
-            dest='install_options',
-            action='append',
-            help="Extra arguments to be supplied to the setup.py install "
-            "command (use like --install-option=\"--install-scripts=/usr/local/bin\"). "
-            "Use multiple --install-option options to pass multiple options to setup.py install. "
-            "If you are using an option with a directory path, be sure to use absolute path.")
+        cmd_opts.add_option(cmdoptions.ignore_requires_python())
+        cmd_opts.add_option(cmdoptions.no_deps())
 
-        self.parser.add_option(
-            '--global-option',
-            dest='global_options',
-            action='append',
-            help="Extra global options to be supplied to the setup.py "
-            "call before the install command")
+        cmd_opts.add_option(cmdoptions.install_options())
+        cmd_opts.add_option(cmdoptions.global_options())
 
-        self.parser.add_option(
+        cmd_opts.add_option(
             '--user',
             dest='use_user_site',
             action='store_true',
-            help='Install to user-site')
+            help="Install to the Python user install directory for your "
+                 "platform. Typically ~/.local/, or %APPDATA%\Python on "
+                 "Windows. (See the Python documentation for site.USER_BASE "
+                 "for full details.)")
 
-        self.parser.add_option(
+        cmd_opts.add_option(
             '--egg',
             dest='as_egg',
             action='store_true',
-            help="Install as self contained egg file, like easy_install does.")
+            help="Install packages as eggs, not 'flat', like pip normally "
+                 "does. This option is not about installing *from* eggs. "
+                 "(WARNING: Because this option overrides pip's normal install"
+                 " logic, requirements files may not behave as expected.)")
 
-    def _build_package_finder(self, options, index_urls):
-        """
-        Create a package finder appropriate to this install command.
-        This method is meant to be overridden by subclasses, not
-        called directly.
-        """
-        return PackageFinder(find_links=options.find_links,
-                             index_urls=index_urls,
-                             use_mirrors=options.use_mirrors,
-                             mirrors=options.mirrors)
+        cmd_opts.add_option(
+            '--root',
+            dest='root_path',
+            metavar='dir',
+            default=None,
+            help="Install everything relative to this alternate root "
+                 "directory.")
+
+        cmd_opts.add_option(
+            '--prefix',
+            dest='prefix_path',
+            metavar='dir',
+            default=None,
+            help="Installation prefix where lib, bin and other top-level "
+                 "folders are placed")
+
+        cmd_opts.add_option(
+            "--compile",
+            action="store_true",
+            dest="compile",
+            default=True,
+            help="Compile py files to pyc",
+        )
+
+        cmd_opts.add_option(
+            "--no-compile",
+            action="store_false",
+            dest="compile",
+            help="Do not compile py files to pyc",
+        )
+
+        cmd_opts.add_option(cmdoptions.use_wheel())
+        cmd_opts.add_option(cmdoptions.no_use_wheel())
+        cmd_opts.add_option(cmdoptions.no_binary())
+        cmd_opts.add_option(cmdoptions.only_binary())
+        cmd_opts.add_option(cmdoptions.pre())
+        cmd_opts.add_option(cmdoptions.no_clean())
+        cmd_opts.add_option(cmdoptions.require_hashes())
+
+        index_opts = cmdoptions.make_option_group(
+            cmdoptions.index_group,
+            self.parser,
+        )
+
+        self.parser.insert_option_group(0, index_opts)
+        self.parser.insert_option_group(0, cmd_opts)
 
     def run(self, options, args):
+        cmdoptions.resolve_wheel_no_use_binary(options)
+        cmdoptions.check_install_build_global(options)
+
+        if options.as_egg:
+            warnings.warn(
+                "--egg has been deprecated and will be removed in the future. "
+                "This flag is mutually exclusive with large parts of pip, and "
+                "actually using it invalidates pip's ability to manage the "
+                "installation process.",
+                RemovedInPip10Warning,
+            )
+
+        if options.allow_external:
+            warnings.warn(
+                "--allow-external has been deprecated and will be removed in "
+                "the future. Due to changes in the repository protocol, it no "
+                "longer has any effect.",
+                RemovedInPip10Warning,
+            )
+
+        if options.allow_all_external:
+            warnings.warn(
+                "--allow-all-external has been deprecated and will be removed "
+                "in the future. Due to changes in the repository protocol, it "
+                "no longer has any effect.",
+                RemovedInPip10Warning,
+            )
+
+        if options.allow_unverified:
+            warnings.warn(
+                "--allow-unverified has been deprecated and will be removed "
+                "in the future. Due to changes in the repository protocol, it "
+                "no longer has any effect.",
+                RemovedInPip10Warning,
+            )
+
         if options.download_dir:
-            options.no_install = True
+            warnings.warn(
+                "pip install --download has been deprecated and will be "
+                "removed in the future. Pip now has a download command that "
+                "should be used instead.",
+                RemovedInPip10Warning,
+            )
             options.ignore_installed = True
-        options.build_dir = os.path.abspath(options.build_dir)
+
+        if options.build_dir:
+            options.build_dir = os.path.abspath(options.build_dir)
+
         options.src_dir = os.path.abspath(options.src_dir)
         install_options = options.install_options or []
         if options.use_user_site:
+            if options.prefix_path:
+                raise CommandError(
+                    "Can not combine '--user' and '--prefix' as they imply "
+                    "different installation locations"
+                )
             if virtualenv_no_global():
-                raise InstallationError("Can not perform a '--user' install. User site-packages are not visible in this virtualenv.")
+                raise InstallationError(
+                    "Can not perform a '--user' install. User site-packages "
+                    "are not visible in this virtualenv."
+                )
             install_options.append('--user')
+            install_options.append('--prefix=')
+
+        temp_target_dir = None
         if options.target_dir:
             options.ignore_installed = True
             temp_target_dir = tempfile.mkdtemp()
             options.target_dir = os.path.abspath(options.target_dir)
-            if os.path.exists(options.target_dir) and not os.path.isdir(options.target_dir):
-                raise CommandError("Target path exists but is not a directory, will not continue.")
+            if (os.path.exists(options.target_dir) and not
+                    os.path.isdir(options.target_dir)):
+                raise CommandError(
+                    "Target path exists but is not a directory, will not "
+                    "continue."
+                )
             install_options.append('--home=' + temp_target_dir)
+
         global_options = options.global_options or []
-        index_urls = [options.index_url] + options.extra_index_urls
-        if options.no_index:
-            logger.notify('Ignoring indexes: %s' % ','.join(index_urls))
-            index_urls = []
 
-        finder = self._build_package_finder(options, index_urls)
+        with self._build_session(options) as session:
 
-        requirement_set = RequirementSet(
-            build_dir=options.build_dir,
-            src_dir=options.src_dir,
-            download_dir=options.download_dir,
-            download_cache=options.download_cache,
-            upgrade=options.upgrade,
-            as_egg=options.as_egg,
-            ignore_installed=options.ignore_installed,
-            ignore_dependencies=options.ignore_dependencies,
-            force_reinstall=options.force_reinstall,
-            use_user_site=options.use_user_site)
-        for name in args:
-            requirement_set.add_requirement(
-                InstallRequirement.from_line(name, None))
-        for name in options.editables:
-            requirement_set.add_requirement(
-                InstallRequirement.from_editable(name, default_vcs=options.default_vcs))
-        for filename in options.requirements:
-            for req in parse_requirements(filename, finder=finder, options=options):
-                requirement_set.add_requirement(req)
-        if not requirement_set.has_requirements:
-            opts = {'name': self.name}
-            if options.find_links:
-                msg = ('You must give at least one requirement to %(name)s '
-                       '(maybe you meant "pip %(name)s %(links)s"?)' %
-                       dict(opts, links=' '.join(options.find_links)))
-            else:
-                msg = ('You must give at least one requirement '
-                       'to %(name)s (see "pip help %(name)s")' % opts)
-            logger.warn(msg)
-            return
+            finder = self._build_package_finder(options, session)
+            build_delete = (not (options.no_clean or options.build_dir))
+            wheel_cache = WheelCache(options.cache_dir, options.format_control)
+            if options.cache_dir and not check_path_owner(options.cache_dir):
+                logger.warning(
+                    "The directory '%s' or its parent directory is not owned "
+                    "by the current user and caching wheels has been "
+                    "disabled. check the permissions and owner of that "
+                    "directory. If executing pip with sudo, you may want "
+                    "sudo's -H flag.",
+                    options.cache_dir,
+                )
+                options.cache_dir = None
 
-        if (options.use_user_site and
-            sys.version_info < (2, 6)):
-            raise InstallationError('--user is only supported in Python version 2.6 and newer')
+            with BuildDirectory(options.build_dir,
+                                delete=build_delete) as build_dir:
+                requirement_set = RequirementSet(
+                    build_dir=build_dir,
+                    src_dir=options.src_dir,
+                    download_dir=options.download_dir,
+                    upgrade=options.upgrade,
+                    upgrade_strategy=options.upgrade_strategy,
+                    as_egg=options.as_egg,
+                    ignore_installed=options.ignore_installed,
+                    ignore_dependencies=options.ignore_dependencies,
+                    ignore_requires_python=options.ignore_requires_python,
+                    force_reinstall=options.force_reinstall,
+                    use_user_site=options.use_user_site,
+                    target_dir=temp_target_dir,
+                    session=session,
+                    pycompile=options.compile,
+                    isolated=options.isolated_mode,
+                    wheel_cache=wheel_cache,
+                    require_hashes=options.require_hashes,
+                )
 
-        import setuptools
-        if (options.use_user_site and
-            requirement_set.has_editables and
-            not getattr(setuptools, '_distribute', False)):
+                self.populate_requirement_set(
+                    requirement_set, args, options, finder, session, self.name,
+                    wheel_cache
+                )
 
-            raise InstallationError('--user --editable not supported with setuptools, use distribute')
+                if not requirement_set.has_requirements:
+                    return
 
-        if not options.no_download:
-            requirement_set.prepare_files(finder, force_root_egg_info=self.bundle, bundle=self.bundle)
-        else:
-            requirement_set.locate_files()
+                try:
+                    if (options.download_dir or not wheel or not
+                            options.cache_dir):
+                        # on -d don't do complex things like building
+                        # wheels, and don't try to build wheels when wheel is
+                        # not installed.
+                        requirement_set.prepare_files(finder)
+                    else:
+                        # build wheels before install.
+                        wb = WheelBuilder(
+                            requirement_set,
+                            finder,
+                            build_options=[],
+                            global_options=[],
+                        )
+                        # Ignore the result: a failed wheel will be
+                        # installed from the sdist/vcs whatever.
+                        wb.build(autobuilding=True)
 
-        if not options.no_install and not self.bundle:
-            requirement_set.install(install_options, global_options)
-            installed = ' '.join([req.name for req in
-                                  requirement_set.successfully_installed])
-            if installed:
-                logger.notify('Successfully installed %s' % installed)
-        elif not self.bundle:
-            downloaded = ' '.join([req.name for req in
-                                   requirement_set.successfully_downloaded])
-            if downloaded:
-                logger.notify('Successfully downloaded %s' % downloaded)
-        elif self.bundle:
-            requirement_set.create_bundle(self.bundle_filename)
-            logger.notify('Created bundle in %s' % self.bundle_filename)
-        # Clean up
-        if not options.no_install or options.download_dir:
-            requirement_set.cleanup_files(bundle=self.bundle)
+                    if not options.download_dir:
+                        requirement_set.install(
+                            install_options,
+                            global_options,
+                            root=options.root_path,
+                            prefix=options.prefix_path,
+                        )
+
+                        possible_lib_locations = get_lib_location_guesses(
+                            user=options.use_user_site,
+                            home=temp_target_dir,
+                            root=options.root_path,
+                            prefix=options.prefix_path,
+                            isolated=options.isolated_mode,
+                        )
+                        reqs = sorted(
+                            requirement_set.successfully_installed,
+                            key=operator.attrgetter('name'))
+                        items = []
+                        for req in reqs:
+                            item = req.name
+                            try:
+                                installed_version = get_installed_version(
+                                    req.name, possible_lib_locations
+                                )
+                                if installed_version:
+                                    item += '-' + installed_version
+                            except Exception:
+                                pass
+                            items.append(item)
+                        installed = ' '.join(items)
+                        if installed:
+                            logger.info('Successfully installed %s', installed)
+                    else:
+                        downloaded = ' '.join([
+                            req.name
+                            for req in requirement_set.successfully_downloaded
+                        ])
+                        if downloaded:
+                            logger.info(
+                                'Successfully downloaded %s', downloaded
+                            )
+                except PreviousBuildDirError:
+                    options.no_clean = True
+                    raise
+                finally:
+                    # Clean up
+                    if not options.no_clean:
+                        requirement_set.cleanup_files()
+
         if options.target_dir:
-            if not os.path.exists(options.target_dir):
-                os.makedirs(options.target_dir)
-            lib_dir = home_lib(temp_target_dir)
-            for item in os.listdir(lib_dir):
-                shutil.move(
-                    os.path.join(lib_dir, item),
-                    os.path.join(options.target_dir, item)
+            ensure_dir(options.target_dir)
+
+            # Checking both purelib and platlib directories for installed
+            # packages to be moved to target directory
+            lib_dir_list = []
+
+            purelib_dir = distutils_scheme('', home=temp_target_dir)['purelib']
+            platlib_dir = distutils_scheme('', home=temp_target_dir)['platlib']
+
+            if os.path.exists(purelib_dir):
+                lib_dir_list.append(purelib_dir)
+            if os.path.exists(platlib_dir) and platlib_dir != purelib_dir:
+                lib_dir_list.append(platlib_dir)
+
+            for lib_dir in lib_dir_list:
+                for item in os.listdir(lib_dir):
+                    target_item_dir = os.path.join(options.target_dir, item)
+                    if os.path.exists(target_item_dir):
+                        if not options.upgrade:
+                            logger.warning(
+                                'Target directory %s already exists. Specify '
+                                '--upgrade to force replacement.',
+                                target_item_dir
+                            )
+                            continue
+                        if os.path.islink(target_item_dir):
+                            logger.warning(
+                                'Target directory %s already exists and is '
+                                'a link. Pip will not automatically replace '
+                                'links, please remove if replacement is '
+                                'desired.',
+                                target_item_dir
+                            )
+                            continue
+                        if os.path.isdir(target_item_dir):
+                            shutil.rmtree(target_item_dir)
+                        else:
+                            os.remove(target_item_dir)
+
+                    shutil.move(
+                        os.path.join(lib_dir, item),
+                        target_item_dir
                     )
             shutil.rmtree(temp_target_dir)
         return requirement_set
 
 
-InstallCommand()
+def get_lib_location_guesses(*args, **kwargs):
+    scheme = distutils_scheme('', *args, **kwargs)
+    return [scheme['purelib'], scheme['platlib']]
