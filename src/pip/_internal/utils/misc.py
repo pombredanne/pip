@@ -724,6 +724,7 @@ def call_subprocess(
         env.update(extra_environ)
     for name in unset_environ:
         env.pop(name, None)
+    env = {k: str(v) if isinstance(v, unicode) else v for k, v in env.items()}     
     try:
         proc = subprocess.Popen(
             cmd, stderr=subprocess.STDOUT, stdin=subprocess.PIPE,

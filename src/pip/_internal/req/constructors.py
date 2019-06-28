@@ -213,6 +213,7 @@ def install_req_from_line(
     """Creates an InstallRequirement from a name, which might be a
     requirement, directory containing 'setup.py', filename, or URL.
     """
+    name = unicode(name)
     if is_url(name):
         marker_sep = '; '
     else:

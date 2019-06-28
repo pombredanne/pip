@@ -72,7 +72,7 @@ class TempDirectory(object):
         # scripts, so we canonicalize the path by traversing potential
         # symlinks here.
         self.path = os.path.realpath(
-            tempfile.mkdtemp(prefix="pip-{}-".format(self.kind))
+            tempfile.mkdtemp(prefix=u"pip-{}-".format(self.kind))
         )
         logger.debug("Created temporary directory: {}".format(self.path))
 
@@ -150,6 +150,6 @@ class AdjacentTempDirectory(TempDirectory):
         if not self.path:
             # Final fallback on the default behavior.
             self.path = os.path.realpath(
-                tempfile.mkdtemp(prefix="pip-{}-".format(self.kind))
+                tempfile.mkdtemp(prefix=u"pip-{}-".format(self.kind))
             )
         logger.debug("Created temporary directory: {}".format(self.path))
