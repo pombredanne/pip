@@ -4,27 +4,39 @@
 util tests
 
 """
+import codecs
+import itertools
 import os
+import shutil
 import stat
 import sys
-import time
-import shutil
 import tempfile
+import time
 import warnings
+from io import BytesIO
+from logging import DEBUG, ERROR, INFO, WARNING
+from textwrap import dedent
 
 import pytest
-
 from mock import Mock, patch
-from pip.exceptions import (HashMismatch, HashMissing, InstallationError,
-                            UnsupportedPythonVersion)
-from pip.utils import (egg_link_path, get_installed_distributions,
-                       untar_file, unzip_file, rmtree, normalize_path)
-from pip.utils.build import BuildDirectory
-from pip.utils.encoding import auto_decode
-from pip.utils.hashes import Hashes, MissingHashes
-from pip.utils.glibc import check_glibc_version
-from pip.utils.packaging import check_dist_requires_python
-from pip._vendor.six import BytesIO
+from pip._vendor.six.moves.urllib import request as urllib_request
+
+from pip._internal.exceptions import (
+    HashMismatch, HashMissing, InstallationError,
+)
+from pip._internal.utils.deprecation import PipDeprecationWarning, deprecated
+from pip._internal.utils.encoding import BOMS, auto_decode
+from pip._internal.utils.glibc import check_glibc_version
+from pip._internal.utils.hashes import Hashes, MissingHashes
+from pip._internal.utils.misc import (
+    call_subprocess, egg_link_path, ensure_dir, format_command_args,
+    get_installed_distributions, get_prog, make_subprocess_output_error,
+    normalize_path, normalize_version_info, path_to_url, redact_netloc,
+    redact_password_from_url, remove_auth_from_url, rmtree,
+    split_auth_from_netloc, split_auth_netloc_from_url, untar_file, unzip_file,
+)
+from pip._internal.utils.temp_dir import AdjacentTempDirectory, TempDirectory
+from pip._internal.utils.ui import SpinnerInterface
 
 
 class Tests_EgglinkPath:
@@ -47,7 +59,7 @@ class Tests_EgglinkPath:
         )
 
         # patches
-        from pip import utils
+        from pip._internal.utils import misc as utils
         self.old_site_packages = utils.site_packages
         self.mock_site_packages = utils.site_packages = 'SITE_PACKAGES'
         self.old_running_under_virtualenv = utils.running_under_virtualenv
@@ -62,7 +74,7 @@ class Tests_EgglinkPath:
         self.mock_isfile = path.isfile = Mock()
 
     def teardown(self):
-        from pip import utils
+        from pip._internal.utils import misc as utils
         utils.site_packages = self.old_site_packages
         utils.running_under_virtualenv = self.old_running_under_virtualenv
         utils.virtualenv_no_global = self.old_virtualenv_no_global
@@ -161,9 +173,9 @@ class Tests_EgglinkPath:
         assert egg_link_path(self.mock_dist) is None
 
 
-@patch('pip.utils.dist_in_usersite')
-@patch('pip.utils.dist_is_local')
-@patch('pip.utils.dist_is_editable')
+@patch('pip._internal.utils.misc.dist_in_usersite')
+@patch('pip._internal.utils.misc.dist_is_local')
+@patch('pip._internal.utils.misc.dist_is_editable')
 class Tests_get_installed_distributions:
     """test util.get_installed_distributions"""
 
@@ -238,19 +250,6 @@ class Tests_get_installed_distributions:
         assert len(dists) == 1
         assert dists[0].test_name == "user"
 
-    @pytest.mark.skipif("sys.version_info >= (2,7)")
-    @patch('pip._vendor.pkg_resources.working_set', workingset_stdlib)
-    def test_py26_excludes(self, mock_dist_is_editable,
-                           mock_dist_is_local,
-                           mock_dist_in_usersite):
-        mock_dist_is_editable.side_effect = self.dist_is_editable
-        mock_dist_is_local.side_effect = self.dist_is_local
-        mock_dist_in_usersite.side_effect = self.dist_in_usersite
-        dists = get_installed_distributions()
-        assert len(dists) == 1
-        assert dists[0].key == 'argparse'
-
-    @pytest.mark.skipif("sys.version_info < (2,7)")
     @patch('pip._vendor.pkg_resources.working_set', workingset_stdlib)
     def test_gte_py27_excludes(self, mock_dist_is_editable,
                                mock_dist_is_local,
@@ -288,6 +287,8 @@ class TestUnpackArchives(object):
        script_world.sh  601 script where world can execute
        dir              744 directory
        dir/dirfile      622 regular file
+     4) the file contents are extracted correctly (though the content of
+        each file isn't currently unique)
 
     """
 
@@ -306,19 +307,25 @@ class TestUnpackArchives(object):
     def confirm_files(self):
         # expectations based on 022 umask set above and the unpack logic that
         # sets execute permissions, not preservation
-        for fname, expected_mode, test in [
-                ('file.txt', 0o644, os.path.isfile),
-                ('symlink.txt', 0o644, os.path.isfile),
-                ('script_owner.sh', 0o755, os.path.isfile),
-                ('script_group.sh', 0o755, os.path.isfile),
-                ('script_world.sh', 0o755, os.path.isfile),
-                ('dir', 0o755, os.path.isdir),
-                (os.path.join('dir', 'dirfile'), 0o644, os.path.isfile)]:
+        for fname, expected_mode, test, expected_contents in [
+                ('file.txt', 0o644, os.path.isfile, b'file\n'),
+                # We don't test the "symlink.txt" contents for now.
+                ('symlink.txt', 0o644, os.path.isfile, None),
+                ('script_owner.sh', 0o755, os.path.isfile, b'file\n'),
+                ('script_group.sh', 0o755, os.path.isfile, b'file\n'),
+                ('script_world.sh', 0o755, os.path.isfile, b'file\n'),
+                ('dir', 0o755, os.path.isdir, None),
+                (os.path.join('dir', 'dirfile'), 0o644, os.path.isfile, b''),
+        ]:
             path = os.path.join(self.tempdir, fname)
             if path.endswith('symlink.txt') and sys.platform == 'win32':
                 # no symlinks created on windows
                 continue
             assert test(path), path
+            if expected_contents is not None:
+                with open(path, mode='rb') as f:
+                    contents = f.read()
+                assert contents == expected_contents, 'fname: {}'.format(fname)
             if sys.platform == 'win32':
                 # the permissions tests below don't apply in windows
                 # due to os.chmod being a noop
@@ -361,7 +368,7 @@ class Failer:
 
 def test_rmtree_retries(tmpdir, monkeypatch):
     """
-    Test pip.utils.rmtree will retry failures
+    Test pip._internal.utils.rmtree will retry failures
     """
     monkeypatch.setattr(shutil, 'rmtree', Failer(duration=1).call)
     rmtree('foo')
@@ -369,7 +376,7 @@ def test_rmtree_retries(tmpdir, monkeypatch):
 
 def test_rmtree_retries_for_3sec(tmpdir, monkeypatch):
     """
-    Test pip.utils.rmtree will retry failures for no more than 3 sec
+    Test pip._internal.utils.rmtree will retry failures for no more than 3 sec
     """
     monkeypatch.setattr(shutil, 'rmtree', Failer(duration=5).call)
     with pytest.raises(OSError):
@@ -414,7 +421,7 @@ class Test_normalize_path(object):
 
 
 class TestHashes(object):
-    """Tests for pip.utils.hashes"""
+    """Tests for pip._internal.utils.hashes"""
 
     def test_success(self, tmpdir):
         """Make sure no error is raised when at least one hash matches.
@@ -458,13 +465,22 @@ class TestHashes(object):
 
 
 class TestEncoding(object):
-    """Tests for pip.utils.encoding"""
+    """Tests for pip._internal.utils.encoding"""
 
-    def test_auto_decode_utf16_le(self):
+    def test_auto_decode_utf_16_le(self):
         data = (
             b'\xff\xfeD\x00j\x00a\x00n\x00g\x00o\x00=\x00'
             b'=\x001\x00.\x004\x00.\x002\x00'
         )
+        assert data.startswith(codecs.BOM_UTF16_LE)
+        assert auto_decode(data) == "Django==1.4.2"
+
+    def test_auto_decode_utf_16_be(self):
+        data = (
+            b'\xfe\xff\x00D\x00j\x00a\x00n\x00g\x00o\x00='
+            b'\x00=\x001\x00.\x004\x00.\x002'
+        )
+        assert data.startswith(codecs.BOM_UTF16_BE)
         assert auto_decode(data) == "Django==1.4.2"
 
     def test_auto_decode_no_bom(self):
@@ -474,28 +490,186 @@ class TestEncoding(object):
         latin1_req = u'# coding=latin1\n# Pas trop de café'
         assert auto_decode(latin1_req.encode('latin1')) == latin1_req
 
+    def test_auto_decode_no_preferred_encoding(self):
+        om, em = Mock(), Mock()
+        om.return_value = 'ascii'
+        em.return_value = None
+        data = u'data'
+        with patch('sys.getdefaultencoding', om):
+            with patch('locale.getpreferredencoding', em):
+                ret = auto_decode(data.encode(sys.getdefaultencoding()))
+        assert ret == data
 
-class TestBuildDirectory(object):
+    @pytest.mark.parametrize('encoding', [encoding for bom, encoding in BOMS])
+    def test_all_encodings_are_valid(self, encoding):
+        # we really only care that there is no LookupError
+        assert ''.encode(encoding).decode(encoding) == ''
+
+
+class TestTempDirectory(object):
+
     # No need to test symlinked directories on Windows
     @pytest.mark.skipif("sys.platform == 'win32'")
-    def test_build_directory(self):
-        with BuildDirectory() as build_dir:
-            tmp_dir = tempfile.mkdtemp(prefix="pip-build-test")
+    def test_symlinked_path(self):
+        with TempDirectory() as tmp_dir:
+            assert os.path.exists(tmp_dir.path)
+
+            alt_tmp_dir = tempfile.mkdtemp(prefix="pip-test-")
             assert (
-                os.path.dirname(build_dir) ==
-                os.path.dirname(os.path.realpath(tmp_dir))
+                os.path.dirname(tmp_dir.path) ==
+                os.path.dirname(os.path.realpath(alt_tmp_dir))
             )
             # are we on a system where /tmp is a symlink
-            if os.path.realpath(tmp_dir) != os.path.abspath(tmp_dir):
-                assert os.path.dirname(build_dir) != os.path.dirname(tmp_dir)
+            if os.path.realpath(alt_tmp_dir) != os.path.abspath(alt_tmp_dir):
+                assert (
+                    os.path.dirname(tmp_dir.path) !=
+                    os.path.dirname(alt_tmp_dir)
+                )
             else:
-                assert os.path.dirname(build_dir) == os.path.dirname(tmp_dir)
-            os.rmdir(tmp_dir)
-            assert not os.path.exists(tmp_dir)
+                assert (
+                    os.path.dirname(tmp_dir.path) ==
+                    os.path.dirname(alt_tmp_dir)
+                )
+            os.rmdir(tmp_dir.path)
+            assert not os.path.exists(tmp_dir.path)
+
+    def test_deletes_readonly_files(self):
+        def create_file(*args):
+            fpath = os.path.join(*args)
+            ensure_dir(os.path.dirname(fpath))
+            with open(fpath, "w") as f:
+                f.write("Holla!")
+
+        def readonly_file(*args):
+            fpath = os.path.join(*args)
+            os.chmod(fpath, stat.S_IREAD)
+
+        with TempDirectory() as tmp_dir:
+            create_file(tmp_dir.path, "normal-file")
+            create_file(tmp_dir.path, "readonly-file")
+            readonly_file(tmp_dir.path, "readonly-file")
+
+            create_file(tmp_dir.path, "subfolder", "normal-file")
+            create_file(tmp_dir.path, "subfolder", "readonly-file")
+            readonly_file(tmp_dir.path, "subfolder", "readonly-file")
+
+        assert tmp_dir.path is None
+
+    def test_create_and_cleanup_work(self):
+        tmp_dir = TempDirectory()
+        assert tmp_dir.path is None
+
+        tmp_dir.create()
+        created_path = tmp_dir.path
+        assert tmp_dir.path is not None
+        assert os.path.exists(created_path)
+
+        tmp_dir.cleanup()
+        assert tmp_dir.path is None
+        assert not os.path.exists(created_path)
+
+    @pytest.mark.parametrize("name", [
+        "ABC",
+        "ABC.dist-info",
+        "_+-",
+        "_package",
+        "A......B",
+        "AB",
+        "A",
+        "2",
+    ])
+    def test_adjacent_directory_names(self, name):
+        def names():
+            return AdjacentTempDirectory._generate_names(name)
+
+        chars = AdjacentTempDirectory.LEADING_CHARS
+
+        # Ensure many names are unique
+        # (For long *name*, this sequence can be extremely long.
+        # However, since we're only ever going to take the first
+        # result that works, provided there are many of those
+        # and that shorter names result in totally unique sets,
+        # it's okay to skip part of the test.)
+        some_names = list(itertools.islice(names(), 1000))
+        # We should always get at least 1000 names
+        assert len(some_names) == 1000
+
+        # Ensure original name does not appear early in the set
+        assert name not in some_names
+
+        if len(name) > 2:
+            # Names should be at least 90% unique (given the infinite
+            # range of inputs, and the possibility that generated names
+            # may already exist on disk anyway, this is a much cheaper
+            # criteria to enforce than complete uniqueness).
+            assert len(some_names) > 0.9 * len(set(some_names))
+
+            # Ensure the first few names are the same length as the original
+            same_len = list(itertools.takewhile(
+                lambda x: len(x) == len(name),
+                some_names
+            ))
+            assert len(same_len) > 10
+
+            # Check the first group are correct
+            expected_names = ['~' + name[1:]]
+            expected_names.extend('~' + c + name[2:] for c in chars)
+            for x, y in zip(some_names, expected_names):
+                assert x == y
+
+        else:
+            # All names are going to be longer than our original
+            assert min(len(x) for x in some_names) > 1
+
+            # All names are going to be unique
+            assert len(some_names) == len(set(some_names))
+
+            if len(name) == 2:
+                # All but the first name are going to end with our original
+                assert all(x.endswith(name) for x in some_names[1:])
+            else:
+                # All names are going to end with our original
+                assert all(x.endswith(name) for x in some_names)
+
+    @pytest.mark.parametrize("name", [
+        "A",
+        "ABC",
+        "ABC.dist-info",
+        "_+-",
+        "_package",
+    ])
+    def test_adjacent_directory_exists(self, name, tmpdir):
+        block_name, expect_name = itertools.islice(
+            AdjacentTempDirectory._generate_names(name), 2)
+
+        original = os.path.join(tmpdir, name)
+        blocker = os.path.join(tmpdir, block_name)
+
+        ensure_dir(original)
+        ensure_dir(blocker)
+
+        with AdjacentTempDirectory(original) as atmp_dir:
+            assert expect_name == os.path.split(atmp_dir.path)[1]
+
+    def test_adjacent_directory_permission_error(self, monkeypatch):
+        name = "ABC"
+
+        def raising_mkdir(*args, **kwargs):
+            raise OSError("Unknown OSError")
+
+        with TempDirectory() as tmp_dir:
+            original = os.path.join(tmp_dir.path, name)
+
+            ensure_dir(original)
+            monkeypatch.setattr("os.mkdir", raising_mkdir)
+
+            with pytest.raises(OSError):
+                with AdjacentTempDirectory(original):
+                    pass
 
 
 class TestGlibc(object):
-    def test_manylinux1_check_glibc_version(self):
+    def test_manylinux_check_glibc_version(self):
         """
         Test that the check_glibc_version function is robust against weird
         glibc version strings.
@@ -528,23 +702,535 @@ class TestGlibc(object):
                     assert False
 
 
-class TestCheckRequiresPython(object):
+@pytest.mark.parametrize('version_info, expected', [
+    (None, None),
+    ((), (0, 0, 0)),
+    ((3, ), (3, 0, 0)),
+    ((3, 6), (3, 6, 0)),
+    ((3, 6, 2), (3, 6, 2)),
+    ((3, 6, 2, 4), (3, 6, 2)),
+])
+def test_normalize_version_info(version_info, expected):
+    actual = normalize_version_info(version_info)
+    assert actual == expected
+
+
+class TestGetProg(object):
 
     @pytest.mark.parametrize(
-        ("metadata", "should_raise"),
+        ("argv", "executable", "expected"),
         [
-            ("Name: test\n", False),
-            ("Name: test\nRequires-Python:", False),
-            ("Name: test\nRequires-Python: invalid_spec", False),
-            ("Name: test\nRequires-Python: <=1", True),
-        ],
+            ('/usr/bin/pip', '', 'pip'),
+            ('-c', '/usr/bin/python', '/usr/bin/python -m pip'),
+            ('__main__.py', '/usr/bin/python', '/usr/bin/python -m pip'),
+            ('/usr/bin/pip3', '', 'pip3'),
+        ]
     )
-    def test_check_requires(self, metadata, should_raise):
-        fake_dist = Mock(
-            has_metadata=lambda _: True,
-            get_metadata=lambda _: metadata)
-        if should_raise:
-            with pytest.raises(UnsupportedPythonVersion):
-                check_dist_requires_python(fake_dist)
+    def test_get_prog(self, monkeypatch, argv, executable, expected):
+        monkeypatch.setattr('pip._internal.utils.misc.sys.argv', [argv])
+        monkeypatch.setattr(
+            'pip._internal.utils.misc.sys.executable',
+            executable
+        )
+        assert get_prog() == expected
+
+
+@pytest.mark.parametrize('args, expected', [
+    (['pip', 'list'], 'pip list'),
+    (['foo', 'space space', 'new\nline', 'double"quote', "single'quote"],
+     """foo 'space space' 'new\nline' 'double"quote' 'single'"'"'quote'"""),
+])
+def test_format_command_args(args, expected):
+    actual = format_command_args(args)
+    assert actual == expected
+
+
+def test_make_subprocess_output_error():
+    cmd_args = ['test', 'has space']
+    cwd = '/path/to/cwd'
+    lines = ['line1\n', 'line2\n', 'line3\n']
+    actual = make_subprocess_output_error(
+        cmd_args=cmd_args,
+        cwd=cwd,
+        lines=lines,
+        exit_status=3,
+    )
+    expected = dedent("""\
+    Command errored out with exit status 3:
+     command: test 'has space'
+         cwd: /path/to/cwd
+    Complete output (3 lines):
+    line1
+    line2
+    line3
+    ----------------------------------------""")
+    assert actual == expected, 'actual: {}'.format(actual)
+
+
+# This test is mainly important for checking unicode in Python 2.
+def test_make_subprocess_output_error__unicode():
+    """
+    Test a line with non-ascii unicode characters.
+    """
+    lines = [u'curly-quote: \u2018\n']
+    actual = make_subprocess_output_error(
+        cmd_args=['test'],
+        cwd='/path/to/cwd',
+        lines=lines,
+        exit_status=1,
+    )
+    expected = dedent(u"""\
+    Command errored out with exit status 1:
+     command: test
+         cwd: /path/to/cwd
+    Complete output (1 lines):
+    curly-quote: \u2018
+    ----------------------------------------""")
+    assert actual == expected, u'actual: {}'.format(actual)
+
+
+class FakeSpinner(SpinnerInterface):
+
+    def __init__(self):
+        self.spin_count = 0
+        self.final_status = None
+
+    def spin(self):
+        self.spin_count += 1
+
+    def finish(self, final_status):
+        self.final_status = final_status
+
+
+class TestCallSubprocess(object):
+
+    """
+    Test call_subprocess().
+    """
+
+    def check_result(
+        self, capfd, caplog, log_level, spinner, result, expected,
+        expected_spinner,
+    ):
+        """
+        Check the result of calling call_subprocess().
+
+        :param log_level: the logging level that caplog was set to.
+        :param spinner: the FakeSpinner object passed to call_subprocess()
+            to be checked.
+        :param result: the call_subprocess() return value to be checked.
+        :param expected: a pair (expected_proc, expected_records), where
+            1) `expected_proc` is the expected return value of
+              call_subprocess() as a list of lines, or None if the return
+              value is expected to be None;
+            2) `expected_records` is the expected value of
+              caplog.record_tuples.
+        :param expected_spinner: a 2-tuple of the spinner's expected
+            (spin_count, final_status).
+        """
+        expected_proc, expected_records = expected
+
+        if expected_proc is None:
+            assert result is None
         else:
-            check_dist_requires_python(fake_dist)
+            assert result.splitlines() == expected_proc
+
+        # Confirm that stdout and stderr haven't been written to.
+        captured = capfd.readouterr()
+        assert (captured.out, captured.err) == ('', '')
+
+        records = caplog.record_tuples
+        if len(records) != len(expected_records):
+            raise RuntimeError('{} != {}'.format(records, expected_records))
+
+        for record, expected_record in zip(records, expected_records):
+            # Check the logger_name and log level parts exactly.
+            assert record[:2] == expected_record[:2]
+            # For the message portion, check only a substring.  Also, we
+            # can't use startswith() since the order of stdout and stderr
+            # isn't guaranteed in cases where stderr is also present.
+            # For example, we observed the stderr lines coming before stdout
+            # in CI for PyPy 2.7 even though stdout happens first
+            # chronologically.
+            assert expected_record[2] in record[2]
+
+        assert (spinner.spin_count, spinner.final_status) == expected_spinner
+
+    def prepare_call(self, caplog, log_level, command=None):
+        if command is None:
+            command = 'print("Hello"); print("world")'
+
+        caplog.set_level(log_level)
+        spinner = FakeSpinner()
+        args = [sys.executable, '-c', command]
+
+        return (args, spinner)
+
+    def test_debug_logging(self, capfd, caplog):
+        """
+        Test DEBUG logging (and without passing show_stdout=True).
+        """
+        log_level = DEBUG
+        args, spinner = self.prepare_call(caplog, log_level)
+        result = call_subprocess(args, spinner=spinner)
+
+        expected = (['Hello', 'world'], [
+            ('pip.subprocessor', DEBUG, 'Running command '),
+            ('pip.subprocessor', DEBUG, 'Hello'),
+            ('pip.subprocessor', DEBUG, 'world'),
+        ])
+        # The spinner shouldn't spin in this case since the subprocess
+        # output is already being logged to the console.
+        self.check_result(
+            capfd, caplog, log_level, spinner, result, expected,
+            expected_spinner=(0, None),
+        )
+
+    def test_info_logging(self, capfd, caplog):
+        """
+        Test INFO logging (and without passing show_stdout=True).
+        """
+        log_level = INFO
+        args, spinner = self.prepare_call(caplog, log_level)
+        result = call_subprocess(args, spinner=spinner)
+
+        expected = (['Hello', 'world'], [])
+        # The spinner should spin twice in this case since the subprocess
+        # output isn't being written to the console.
+        self.check_result(
+            capfd, caplog, log_level, spinner, result, expected,
+            expected_spinner=(2, 'done'),
+        )
+
+    def test_info_logging__subprocess_error(self, capfd, caplog):
+        """
+        Test INFO logging of a subprocess with an error (and without passing
+        show_stdout=True).
+        """
+        log_level = INFO
+        command = 'print("Hello"); print("world"); exit("fail")'
+        args, spinner = self.prepare_call(caplog, log_level, command=command)
+
+        with pytest.raises(InstallationError) as exc:
+            call_subprocess(args, spinner=spinner)
+        result = None
+        exc_message = str(exc.value)
+        assert exc_message.startswith(
+            'Command errored out with exit status 1: '
+        )
+        assert exc_message.endswith('Check the logs for full command output.')
+
+        expected = (None, [
+            ('pip.subprocessor', ERROR, 'Complete output (3 lines):\n'),
+        ])
+        # The spinner should spin three times in this case since the
+        # subprocess output isn't being written to the console.
+        self.check_result(
+            capfd, caplog, log_level, spinner, result, expected,
+            expected_spinner=(3, 'error'),
+        )
+
+        # Do some further checking on the captured log records to confirm
+        # that the subprocess output was logged.
+        last_record = caplog.record_tuples[-1]
+        last_message = last_record[2]
+        lines = last_message.splitlines()
+
+        # We have to sort before comparing the lines because we can't
+        # guarantee the order in which stdout and stderr will appear.
+        # For example, we observed the stderr lines coming before stdout
+        # in CI for PyPy 2.7 even though stdout happens first chronologically.
+        actual = sorted(lines)
+        # Test the "command" line separately because we can't test an
+        # exact match.
+        command_line = actual.pop(1)
+        assert actual == [
+            '     cwd: None',
+            '----------------------------------------',
+            'Command errored out with exit status 1:',
+            'Complete output (3 lines):',
+            'Hello',
+            'fail',
+            'world',
+        ], 'lines: {}'.format(actual)  # Show the full output on failure.
+
+        assert command_line.startswith(' command: ')
+        assert command_line.endswith('print("world"); exit("fail")\'')
+
+    def test_info_logging_with_show_stdout_true(self, capfd, caplog):
+        """
+        Test INFO logging with show_stdout=True.
+        """
+        log_level = INFO
+        args, spinner = self.prepare_call(caplog, log_level)
+        result = call_subprocess(args, spinner=spinner, show_stdout=True)
+
+        expected = (['Hello', 'world'], [
+            ('pip.subprocessor', INFO, 'Running command '),
+            ('pip.subprocessor', INFO, 'Hello'),
+            ('pip.subprocessor', INFO, 'world'),
+        ])
+        # The spinner shouldn't spin in this case since the subprocess
+        # output is already being written to the console.
+        self.check_result(
+            capfd, caplog, log_level, spinner, result, expected,
+            expected_spinner=(0, None),
+        )
+
+    @pytest.mark.parametrize((
+        'exit_status', 'show_stdout', 'extra_ok_returncodes', 'log_level',
+        'expected'),
+        [
+            # The spinner should show here because show_stdout=False means
+            # the subprocess should get logged at DEBUG level, but the passed
+            # log level is only INFO.
+            (0, False, None, INFO, (None, 'done', 2)),
+            # Test some cases where the spinner should not be shown.
+            (0, False, None, DEBUG, (None, None, 0)),
+            # Test show_stdout=True.
+            (0, True, None, DEBUG, (None, None, 0)),
+            (0, True, None, INFO, (None, None, 0)),
+            # The spinner should show here because show_stdout=True means
+            # the subprocess should get logged at INFO level, but the passed
+            # log level is only WARNING.
+            (0, True, None, WARNING, (None, 'done', 2)),
+            # Test a non-zero exit status.
+            (3, False, None, INFO, (InstallationError, 'error', 2)),
+            # Test a non-zero exit status also in extra_ok_returncodes.
+            (3, False, (3, ), INFO, (None, 'done', 2)),
+    ])
+    def test_spinner_finish(
+        self, exit_status, show_stdout, extra_ok_returncodes, log_level,
+        caplog, expected,
+    ):
+        """
+        Test that the spinner finishes correctly.
+        """
+        expected_exc_type = expected[0]
+        expected_final_status = expected[1]
+        expected_spin_count = expected[2]
+
+        command = (
+            'print("Hello"); print("world"); exit({})'.format(exit_status)
+        )
+        args, spinner = self.prepare_call(caplog, log_level, command=command)
+        try:
+            call_subprocess(
+                args,
+                show_stdout=show_stdout,
+                extra_ok_returncodes=extra_ok_returncodes,
+                spinner=spinner,
+            )
+        except Exception as exc:
+            exc_type = type(exc)
+        else:
+            exc_type = None
+
+        assert exc_type == expected_exc_type
+        assert spinner.final_status == expected_final_status
+        assert spinner.spin_count == expected_spin_count
+
+    def test_closes_stdin(self):
+        with pytest.raises(InstallationError):
+            call_subprocess(
+                [sys.executable, '-c', 'input()'],
+                show_stdout=True,
+            )
+
+
+@pytest.mark.skipif("sys.platform == 'win32'")
+def test_path_to_url_unix():
+    assert path_to_url('/tmp/file') == 'file:///tmp/file'
+    path = os.path.join(os.getcwd(), 'file')
+    assert path_to_url('file') == 'file://' + urllib_request.pathname2url(path)
+
+
+@pytest.mark.skipif("sys.platform != 'win32'")
+def test_path_to_url_win():
+    assert path_to_url('c:/tmp/file') == 'file:///C:/tmp/file'
+    assert path_to_url('c:\\tmp\\file') == 'file:///C:/tmp/file'
+    assert path_to_url(r'\\unc\as\path') == 'file://unc/as/path'
+    path = os.path.join(os.getcwd(), 'file')
+    assert path_to_url('file') == 'file:' + urllib_request.pathname2url(path)
+
+
+@pytest.mark.parametrize('netloc, expected', [
+    # Test a basic case.
+    ('example.com', ('example.com', (None, None))),
+    # Test with username and no password.
+    ('user@example.com', ('example.com', ('user', None))),
+    # Test with username and password.
+    ('user:pass@example.com', ('example.com', ('user', 'pass'))),
+    # Test with username and empty password.
+    ('user:@example.com', ('example.com', ('user', ''))),
+    # Test the password containing an @ symbol.
+    ('user:pass@word@example.com', ('example.com', ('user', 'pass@word'))),
+    # Test the password containing a : symbol.
+    ('user:pass:word@example.com', ('example.com', ('user', 'pass:word'))),
+    # Test URL-encoded reserved characters.
+    ('user%3Aname:%23%40%5E@example.com',
+     ('example.com', ('user:name', '#@^'))),
+])
+def test_split_auth_from_netloc(netloc, expected):
+    actual = split_auth_from_netloc(netloc)
+    assert actual == expected
+
+
+@pytest.mark.parametrize('url, expected', [
+    # Test a basic case.
+    ('http://example.com/path#anchor',
+     ('http://example.com/path#anchor', 'example.com', (None, None))),
+    # Test with username and no password.
+    ('http://user@example.com/path#anchor',
+     ('http://example.com/path#anchor', 'example.com', ('user', None))),
+    # Test with username and password.
+    ('http://user:pass@example.com/path#anchor',
+     ('http://example.com/path#anchor', 'example.com', ('user', 'pass'))),
+    # Test with username and empty password.
+    ('http://user:@example.com/path#anchor',
+     ('http://example.com/path#anchor', 'example.com', ('user', ''))),
+    # Test the password containing an @ symbol.
+    ('http://user:pass@word@example.com/path#anchor',
+     ('http://example.com/path#anchor', 'example.com', ('user', 'pass@word'))),
+    # Test the password containing a : symbol.
+    ('http://user:pass:word@example.com/path#anchor',
+     ('http://example.com/path#anchor', 'example.com', ('user', 'pass:word'))),
+    # Test URL-encoded reserved characters.
+    ('http://user%3Aname:%23%40%5E@example.com/path#anchor',
+     ('http://example.com/path#anchor', 'example.com', ('user:name', '#@^'))),
+])
+def test_split_auth_netloc_from_url(url, expected):
+    actual = split_auth_netloc_from_url(url)
+    assert actual == expected
+
+
+@pytest.mark.parametrize('netloc, expected', [
+    # Test a basic case.
+    ('example.com', 'example.com'),
+    # Test with username and no password.
+    ('user@example.com', 'user@example.com'),
+    # Test with username and password.
+    ('user:pass@example.com', 'user:****@example.com'),
+    # Test with username and empty password.
+    ('user:@example.com', 'user:****@example.com'),
+    # Test the password containing an @ symbol.
+    ('user:pass@word@example.com', 'user:****@example.com'),
+    # Test the password containing a : symbol.
+    ('user:pass:word@example.com', 'user:****@example.com'),
+    # Test URL-encoded reserved characters.
+    ('user%3Aname:%23%40%5E@example.com', 'user%3Aname:****@example.com'),
+])
+def test_redact_netloc(netloc, expected):
+    actual = redact_netloc(netloc)
+    assert actual == expected
+
+
+@pytest.mark.parametrize('auth_url, expected_url', [
+    ('https://user:pass@domain.tld/project/tags/v0.2',
+     'https://domain.tld/project/tags/v0.2'),
+    ('https://domain.tld/project/tags/v0.2',
+     'https://domain.tld/project/tags/v0.2',),
+    ('https://user:pass@domain.tld/svn/project/trunk@8181',
+     'https://domain.tld/svn/project/trunk@8181'),
+    ('https://domain.tld/project/trunk@8181',
+     'https://domain.tld/project/trunk@8181',),
+    ('git+https://pypi.org/something',
+     'git+https://pypi.org/something'),
+    ('git+https://user:pass@pypi.org/something',
+     'git+https://pypi.org/something'),
+    ('git+ssh://git@pypi.org/something',
+     'git+ssh://pypi.org/something'),
+])
+def test_remove_auth_from_url(auth_url, expected_url):
+    url = remove_auth_from_url(auth_url)
+    assert url == expected_url
+
+
+@pytest.mark.parametrize('auth_url, expected_url', [
+    ('https://user@example.com/abc', 'https://user@example.com/abc'),
+    ('https://user:password@example.com', 'https://user:****@example.com'),
+    ('https://user:@example.com', 'https://user:****@example.com'),
+    ('https://example.com', 'https://example.com'),
+    # Test URL-encoded reserved characters.
+    ('https://user%3Aname:%23%40%5E@example.com',
+     'https://user%3Aname:****@example.com'),
+])
+def test_redact_password_from_url(auth_url, expected_url):
+    url = redact_password_from_url(auth_url)
+    assert url == expected_url
+
+
+@pytest.fixture()
+def patch_deprecation_check_version():
+    # We do this, so that the deprecation tests are easier to write.
+    import pip._internal.utils.deprecation as d
+    old_version = d.current_version
+    d.current_version = "1.0"
+    yield
+    d.current_version = old_version
+
+
+@pytest.mark.usefixtures("patch_deprecation_check_version")
+@pytest.mark.parametrize("replacement", [None, "a magic 8 ball"])
+@pytest.mark.parametrize("gone_in", [None, "2.0"])
+@pytest.mark.parametrize("issue", [None, 988])
+def test_deprecated_message_contains_information(gone_in, replacement, issue):
+    with pytest.warns(PipDeprecationWarning) as record:
+        deprecated(
+            "Stop doing this!",
+            replacement=replacement,
+            gone_in=gone_in,
+            issue=issue,
+        )
+
+    assert len(record) == 1
+    message = record[0].message.args[0]
+
+    assert "DEPRECATION: Stop doing this!" in message
+    # Ensure non-None values are mentioned.
+    for item in [gone_in, replacement, issue]:
+        if item is not None:
+            assert str(item) in message
+
+
+@pytest.mark.usefixtures("patch_deprecation_check_version")
+@pytest.mark.parametrize("replacement", [None, "a magic 8 ball"])
+@pytest.mark.parametrize("issue", [None, 988])
+def test_deprecated_raises_error_if_too_old(replacement, issue):
+    with pytest.raises(PipDeprecationWarning) as exception:
+        deprecated(
+            "Stop doing this!",
+            gone_in="1.0",  # this matches the patched version.
+            replacement=replacement,
+            issue=issue,
+        )
+
+    message = exception.value.args[0]
+
+    assert "DEPRECATION: Stop doing this!" in message
+    assert "1.0" in message
+    # Ensure non-None values are mentioned.
+    for item in [replacement, issue]:
+        if item is not None:
+            assert str(item) in message
+
+
+@pytest.mark.usefixtures("patch_deprecation_check_version")
+def test_deprecated_message_reads_well():
+    with pytest.raises(PipDeprecationWarning) as exception:
+        deprecated(
+            "Stop doing this!",
+            gone_in="1.0",  # this matches the patched version.
+            replacement="to be nicer",
+            issue="100000",  # I hope we never reach this number.
+        )
+
+    message = exception.value.args[0]
+
+    assert message == (
+        "DEPRECATION: Stop doing this! "
+        "pip 1.0 will remove support for this functionality. "
+        "A possible replacement is to be nicer. "
+        "You can find discussion regarding this at "
+        "https://github.com/pypa/pip/issues/100000."
+    )

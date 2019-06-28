@@ -1,7 +1,8 @@
-import os
-import sys
-import pytest
+import distutils
 import glob
+import os
+
+import pytest
 
 from tests.lib.path import Path
 
@@ -39,7 +40,7 @@ def test_install_from_broken_wheel(script, data):
                                 editable=False)
 
 
-def test_install_from_wheel(script, data):
+def test_basic_install_from_wheel(script, data):
     """
     Test installing from a wheel (that has a script)
     """
@@ -56,7 +57,7 @@ def test_install_from_wheel(script, data):
     assert script_file in result.files_created
 
 
-def test_install_from_wheel_with_extras(script, data):
+def test_basic_install_from_wheel_with_extras(script, data):
     """
     Test installing from a wheel with extras.
     """
@@ -75,7 +76,7 @@ def test_install_from_wheel_with_extras(script, data):
                                                       result.stdout)
 
 
-def test_install_from_wheel_file(script, data):
+def test_basic_install_from_wheel_file(script, data):
     """
     Test installing directly from a wheel file.
     """
@@ -113,12 +114,10 @@ def test_install_from_wheel_with_headers(script, data):
                                                       result.stdout)
 
 
-@pytest.mark.network
-def test_install_wheel_with_target(script, data):
+def test_install_wheel_with_target(script, data, with_wheel):
     """
     Test installing a wheel using pip install --target
     """
-    script.pip('install', 'wheel')
     target_dir = script.scratch_path / 'target'
     result = script.pip(
         'install', 'simple.dist==0.1', '-t', target_dir,
@@ -127,6 +126,40 @@ def test_install_wheel_with_target(script, data):
     assert Path('scratch') / 'target' / 'simpledist' in result.files_created, (
         str(result)
     )
+
+
+def test_install_wheel_with_target_and_data_files(script, data, with_wheel):
+    """
+    Test for issue #4092. It will be checked that a data_files specification in
+    setup.py is handled correctly when a wheel is installed with the --target
+    option.
+
+    The setup() for the wheel 'prjwithdatafile-1.0-py2.py3-none-any.whl' is as
+    follows ::
+
+        setup(
+            name='prjwithdatafile',
+            version='1.0',
+            packages=['prjwithdatafile'],
+            data_files=[
+                (r'packages1', ['prjwithdatafile/README.txt']),
+                (r'packages2', ['prjwithdatafile/README.txt'])
+            ]
+        )
+    """
+    target_dir = script.scratch_path / 'prjwithdatafile'
+    package = data.packages.join("prjwithdatafile-1.0-py2.py3-none-any.whl")
+    result = script.pip('install', package,
+                        '-t', target_dir,
+                        '--no-index',
+                        expect_error=False)
+
+    assert (Path('scratch') / 'prjwithdatafile' / 'packages1' / 'README.txt'
+            in result.files_created), str(result)
+    assert (Path('scratch') / 'prjwithdatafile' / 'packages2' / 'README.txt'
+            in result.files_created), str(result)
+    assert (Path('scratch') / 'prjwithdatafile' / 'lib' / 'python'
+            not in result.files_created), str(result)
 
 
 def test_install_wheel_with_root(script, data):
@@ -150,11 +183,8 @@ def test_install_wheel_with_prefix(script, data):
         'install', 'simple.dist==0.1', '--prefix', prefix_dir,
         '--no-index', '--find-links=' + data.find_links,
     )
-    if hasattr(sys, "pypy_version_info"):
-        lib = Path('scratch') / 'prefix' / 'site-packages'
-    else:
-        lib = Path('scratch') / 'prefix' / 'lib'
-    assert lib in result.files_created
+    lib = distutils.sysconfig.get_python_lib(prefix=Path('scratch') / 'prefix')
+    assert lib in result.files_created, str(result)
 
 
 def test_install_from_wheel_installs_deps(script, data):
@@ -183,13 +213,27 @@ def test_install_from_wheel_no_deps(script, data):
     assert pkg_folder not in result.files_created
 
 
-@pytest.mark.network
-def test_install_user_wheel(script, virtualenv, data):
+def test_wheel_record_lines_in_deterministic_order(script, data):
+    to_install = data.packages.join("simplewheel-1.0-py2.py3-none-any.whl")
+    result = script.pip('install', to_install)
+
+    dist_info_folder = script.site_packages / 'simplewheel-1.0.dist-info'
+    record_path = dist_info_folder / 'RECORD'
+
+    assert dist_info_folder in result.files_created, str(result)
+    assert record_path in result.files_created, str(result)
+
+    record_path = result.files_created[record_path].full
+    record_lines = [
+        p for p in Path(record_path).read_text().split('\n') if p
+    ]
+    assert record_lines == sorted(record_lines)
+
+
+def test_install_user_wheel(script, data, with_wheel):
     """
     Test user install from wheel (that has a script)
     """
-    virtualenv.system_site_packages = True
-    script.pip('install', 'wheel')
     result = script.pip(
         'install', 'has.script==1.0', '--user', '--no-index',
         '--find-links=' + data.find_links,
@@ -197,7 +241,7 @@ def test_install_user_wheel(script, virtualenv, data):
     egg_info_folder = script.user_site / 'has.script-1.0.dist-info'
     assert egg_info_folder in result.files_created, str(result)
     script_file = script.user_bin / 'script.py'
-    assert script_file in result.files_created
+    assert script_file in result.files_created, str(result)
 
 
 def test_install_from_wheel_gen_entrypoint(script, data):
@@ -376,3 +420,11 @@ def test_wheel_compile_syntax_error(script, data):
     result = script.pip('install', '--compile', package, '--no-index')
     assert 'yield from' not in result.stdout
     assert 'SyntaxError: ' not in result.stdout
+
+
+def test_wheel_install_with_no_cache_dir(script, tmpdir, data):
+    """Check wheel installations work, even with no cache.
+    """
+    package = data.packages.join("simple.dist-0.1-py2.py3-none-any.whl")
+    result = script.pip('install', '--no-cache-dir', '--no-index', package)
+    result.assert_installed('simpledist', editable=False)

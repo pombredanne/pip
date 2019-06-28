@@ -1,20 +1,51 @@
+import compileall
+import fnmatch
+import io
 import os
 import shutil
+import subprocess
+import sys
 
 import pytest
+import six
+from setuptools.wheel import Wheel
 
-from pip.utils import appdirs
-
-from tests.lib import SRC_DIR, TestData
+import pip._internal
+from tests.lib import DATA_DIR, SRC_DIR, TestData
 from tests.lib.path import Path
 from tests.lib.scripttest import PipTestEnvironment
 from tests.lib.venv import VirtualEnvironment
 
 
-def pytest_collection_modifyitems(items):
+def pytest_addoption(parser):
+    parser.addoption(
+        "--keep-tmpdir", action="store_true",
+        default=False, help="keep temporary test directories"
+    )
+    parser.addoption("--use-venv", action="store_true",
+                     help="use venv for virtual environment creation")
+
+
+def pytest_collection_modifyitems(config, items):
     for item in items:
         if not hasattr(item, 'module'):  # e.g.: DoctestTextfile
             continue
+
+        # Mark network tests as flaky
+        if (item.get_closest_marker('network') is not None and
+                "CI" in os.environ):
+            item.add_marker(pytest.mark.flaky(reruns=3))
+
+        if six.PY3:
+            if (item.get_closest_marker('incompatible_with_test_venv') and
+                    config.getoption("--use-venv")):
+                item.add_marker(pytest.mark.skip(
+                    'Incompatible with test venv'))
+            if (item.get_closest_marker('incompatible_with_venv') and
+                    sys.prefix != sys.base_prefix):
+                item.add_marker(pytest.mark.skip(
+                    'Incompatible with venv'))
+
         module_path = os.path.relpath(
             item.module.__file__,
             os.path.commonprefix([__file__, item.module.__file__]),
@@ -27,22 +58,24 @@ def pytest_collection_modifyitems(items):
             item.add_marker(pytest.mark.integration)
         elif module_root_dir.startswith("unit"):
             item.add_marker(pytest.mark.unit)
-
-            # We don't want to allow using the script resource if this is a
-            # unit test, as unit tests should not need all that heavy lifting
-            if set(getattr(item, "funcargnames", [])) & set(["script"]):
-                raise RuntimeError(
-                    "Cannot use the ``script`` funcarg in a unit test: "
-                    "(filename = {0}, item = {1})".format(module_path, item)
-                )
         else:
             raise RuntimeError(
-                "Unknown test type (filename = {0})".format(module_path)
+                "Unknown test type (filename = {})".format(module_path)
             )
 
 
+@pytest.fixture(scope='session')
+def tmpdir_factory(request, tmpdir_factory):
+    """ Modified `tmpdir_factory` session fixture
+    that will automatically cleanup after itself.
+    """
+    yield tmpdir_factory
+    if not request.config.getoption("--keep-tmpdir"):
+        tmpdir_factory.getbasetemp().remove(ignore_errors=True)
+
+
 @pytest.yield_fixture
-def tmpdir(tmpdir):
+def tmpdir(request, tmpdir):
     """
     Return a temporary directory path object which is unique to each test
     function invocation, created as a sub directory of the base temporary
@@ -57,7 +90,8 @@ def tmpdir(tmpdir):
     # Clear out the temporary directory after the test has finished using it.
     # This should prevent us from needing a multiple gigabyte temporary
     # directory while running the tests.
-    tmpdir.remove(ignore_errors=True)
+    if not request.config.getoption("--keep-tmpdir"):
+        tmpdir.remove(ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
@@ -69,8 +103,6 @@ def isolate(tmpdir):
     We use an autouse function scoped fixture because we want to ensure that
     every test has it's own isolated home directory.
     """
-    # TODO: Ensure Windows will respect $HOME, including for the cache
-    #       directory
 
     # TODO: Figure out how to isolate from *system* level configuration files
     #       as well as user level configuration files.
@@ -83,21 +115,36 @@ def isolate(tmpdir):
     fake_root = os.path.join(str(tmpdir), "fake-root")
     os.makedirs(fake_root)
 
-    # Set our home directory to our temporary directory, this should force all
-    # of our relative configuration files to be read from here instead of the
-    # user's actual $HOME directory.
-    os.environ["HOME"] = home_dir
-
-    # Isolate ourselves from XDG directories
-    os.environ["XDG_DATA_HOME"] = os.path.join(home_dir, ".local", "share")
-    os.environ["XDG_CONFIG_HOME"] = os.path.join(home_dir, ".config")
-    os.environ["XDG_CACHE_HOME"] = os.path.join(home_dir, ".cache")
-    os.environ["XDG_RUNTIME_DIR"] = os.path.join(home_dir, ".runtime")
-    os.environ["XDG_DATA_DIRS"] = ":".join([
-        os.path.join(fake_root, "usr", "local", "share"),
-        os.path.join(fake_root, "usr", "share"),
-    ])
-    os.environ["XDG_CONFIG_DIRS"] = os.path.join(fake_root, "etc", "xdg")
+    if sys.platform == 'win32':
+        # Note: this will only take effect in subprocesses...
+        home_drive, home_path = os.path.splitdrive(home_dir)
+        os.environ.update({
+            'USERPROFILE': home_dir,
+            'HOMEDRIVE': home_drive,
+            'HOMEPATH': home_path,
+        })
+        for env_var, sub_path in (
+            ('APPDATA', 'AppData/Roaming'),
+            ('LOCALAPPDATA', 'AppData/Local'),
+        ):
+            path = os.path.join(home_dir, *sub_path.split('/'))
+            os.environ[env_var] = path
+            os.makedirs(path)
+    else:
+        # Set our home directory to our temporary directory, this should force
+        # all of our relative configuration files to be read from here instead
+        # of the user's actual $HOME directory.
+        os.environ["HOME"] = home_dir
+        # Isolate ourselves from XDG directories
+        os.environ["XDG_DATA_HOME"] = os.path.join(home_dir, ".local", "share")
+        os.environ["XDG_CONFIG_HOME"] = os.path.join(home_dir, ".config")
+        os.environ["XDG_CACHE_HOME"] = os.path.join(home_dir, ".cache")
+        os.environ["XDG_RUNTIME_DIR"] = os.path.join(home_dir, ".runtime")
+        os.environ["XDG_DATA_DIRS"] = ":".join([
+            os.path.join(fake_root, "usr", "local", "share"),
+            os.path.join(fake_root, "usr", "share"),
+        ])
+        os.environ["XDG_CONFIG_DIRS"] = os.path.join(fake_root, "etc", "xdg")
 
     # Configure git, because without an author name/email git will complain
     # and cause test failures.
@@ -108,6 +155,10 @@ def isolate(tmpdir):
     # We want to disable the version check from running in the tests
     os.environ["PIP_DISABLE_PIP_VERSION_CHECK"] = "true"
 
+    # Make sure tests don't share a requirements tracker.
+    os.environ.pop('PIP_REQ_TRACKER', None)
+
+    # FIXME: Windows...
     os.makedirs(os.path.join(home_dir, ".config", "git"))
     with open(os.path.join(home_dir, ".config", "git", "config"), "wb") as fp:
         fp.write(
@@ -115,48 +166,119 @@ def isolate(tmpdir):
         )
 
 
-@pytest.fixture
-def virtualenv(tmpdir, monkeypatch, isolate):
+@pytest.fixture(scope='session')
+def pip_src(tmpdir_factory):
+    def not_code_files_and_folders(path, names):
+        # In the root directory, ignore all folders except "src"
+        if path == SRC_DIR:
+            folders = {name for name in names if os.path.isdir(path / name)}
+            return folders - {"src"}
+
+        # Ignore all compiled files and egg-info.
+        ignored = list()
+        for pattern in ["__pycache__", "*.pyc", "pip.egg-info"]:
+            ignored.extend(fnmatch.filter(names, pattern))
+        return set(ignored)
+
+    pip_src = Path(str(tmpdir_factory.mktemp('pip_src'))).join('pip_src')
+    # Copy over our source tree so that each use is self contained
+    shutil.copytree(
+        SRC_DIR,
+        pip_src.abspath,
+        ignore=not_code_files_and_folders,
+    )
+    return pip_src
+
+
+def _common_wheel_editable_install(tmpdir_factory, common_wheels, package):
+    wheel_candidates = list(common_wheels.glob('%s-*.whl' % package))
+    assert len(wheel_candidates) == 1, wheel_candidates
+    install_dir = Path(str(tmpdir_factory.mktemp(package))) / 'install'
+    Wheel(wheel_candidates[0]).install_as_egg(install_dir)
+    (install_dir / 'EGG-INFO').rename(install_dir / '%s.egg-info' % package)
+    assert compileall.compile_dir(str(install_dir), quiet=1)
+    return install_dir
+
+
+@pytest.fixture(scope='session')
+def setuptools_install(tmpdir_factory, common_wheels):
+    return _common_wheel_editable_install(tmpdir_factory,
+                                          common_wheels,
+                                          'setuptools')
+
+
+@pytest.fixture(scope='session')
+def wheel_install(tmpdir_factory, common_wheels):
+    return _common_wheel_editable_install(tmpdir_factory,
+                                          common_wheels,
+                                          'wheel')
+
+
+def install_egg_link(venv, project_name, egg_info_dir):
+    with open(venv.site / 'easy-install.pth', 'a') as fp:
+        fp.write(str(egg_info_dir.abspath) + '\n')
+    with open(venv.site / (project_name + '.egg-link'), 'w') as fp:
+        fp.write(str(egg_info_dir) + '\n.')
+
+
+@pytest.yield_fixture(scope='session')
+def virtualenv_template(request, tmpdir_factory, pip_src,
+                        setuptools_install, common_wheels):
+
+    if six.PY3 and request.config.getoption('--use-venv'):
+        venv_type = 'venv'
+    else:
+        venv_type = 'virtualenv'
+
+    # Create the virtual environment
+    tmpdir = Path(str(tmpdir_factory.mktemp('virtualenv')))
+    venv = VirtualEnvironment(tmpdir.join("venv_orig"), venv_type=venv_type)
+
+    # Install setuptools and pip.
+    install_egg_link(venv, 'setuptools', setuptools_install)
+    pip_editable = Path(str(tmpdir_factory.mktemp('pip'))) / 'pip'
+    pip_src.copytree(pip_editable)
+    assert compileall.compile_dir(str(pip_editable), quiet=1)
+    subprocess.check_call([venv.bin / 'python', 'setup.py', '-q', 'develop'],
+                          cwd=pip_editable)
+
+    # Drop (non-relocatable) launchers.
+    for exe in os.listdir(venv.bin):
+        if not (
+            exe.startswith('python') or
+            exe.startswith('libpy')  # Don't remove libpypy-c.so...
+        ):
+            (venv.bin / exe).remove()
+
+    # Enable user site packages.
+    venv.user_site_packages = True
+
+    # Rename original virtualenv directory to make sure
+    # it's not reused by mistake from one of the copies.
+    venv_template = tmpdir / "venv_template"
+    venv.move(venv_template)
+    yield venv
+
+
+@pytest.yield_fixture
+def virtualenv(virtualenv_template, tmpdir, isolate):
     """
     Return a virtual environment which is unique to each test function
     invocation created inside of a sub directory of the test function's
     temporary directory. The returned object is a
     ``tests.lib.venv.VirtualEnvironment`` object.
     """
-    # Force shutil to use the older method of rmtree that didn't use the fd
-    # functions. These seem to fail on Travis (and only on Travis).
-    monkeypatch.setattr(shutil, "_use_fd_functions", False, raising=False)
-
-    # Copy over our source tree so that each virtual environment is self
-    # contained
-    pip_src = tmpdir.join("pip_src").abspath
-    shutil.copytree(
-        SRC_DIR,
-        pip_src,
-        ignore=shutil.ignore_patterns(
-            "*.pyc", "__pycache__", "contrib", "docs", "tasks", "*.txt",
-            "tests", "pip.egg-info", "build", "dist", ".tox", ".git",
-        ),
-    )
-
-    # Create the virtual environment
-    venv = VirtualEnvironment.create(
-        tmpdir.join("workspace", "venv"),
-        pip_source_dir=pip_src,
-    )
-
-    # Clean out our cache: creating the venv injects wheels into it.
-    if os.path.exists(appdirs.user_cache_dir("pip")):
-        shutil.rmtree(appdirs.user_cache_dir("pip"))
-
-    # Undo our monkeypatching of shutil
-    monkeypatch.undo()
-
-    return venv
+    venv_location = tmpdir.join("workspace", "venv")
+    yield VirtualEnvironment(venv_location, virtualenv_template)
 
 
 @pytest.fixture
-def script(tmpdir, virtualenv):
+def with_wheel(virtualenv, wheel_install):
+    install_egg_link(virtualenv, 'wheel', wheel_install)
+
+
+@pytest.fixture
+def script(tmpdir, virtualenv, deprecated_python):
     """
     Return a PipTestEnvironment which is unique to each test function and
     will execute all commands inside of the unique virtual environment for this
@@ -168,7 +290,7 @@ def script(tmpdir, virtualenv):
         tmpdir.join("workspace"),
 
         # Tell the Test Environment where our virtualenv is located
-        virtualenv=virtualenv.location,
+        virtualenv=virtualenv,
 
         # Do not ignore hidden files, they need to be checked as well
         ignore_hidden=False,
@@ -180,9 +302,52 @@ def script(tmpdir, virtualenv):
         # PipTestEnvironment needs to capture and assert against temp
         capture_temp=True,
         assert_no_temp=True,
+
+        # Deprecated python versions produce an extra deprecation warning
+        pip_expect_warning=deprecated_python,
     )
+
+
+@pytest.fixture(scope="session")
+def common_wheels():
+    """Provide a directory with latest setuptools and wheel wheels"""
+    return DATA_DIR.join('common_wheels')
 
 
 @pytest.fixture
 def data(tmpdir):
     return TestData.copy(tmpdir.join("data"))
+
+
+class InMemoryPipResult(object):
+    def __init__(self, returncode, stdout):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+class InMemoryPip(object):
+    def pip(self, *args):
+        orig_stdout = sys.stdout
+        if six.PY3:
+            stdout = io.StringIO()
+        else:
+            stdout = io.BytesIO()
+        sys.stdout = stdout
+        try:
+            returncode = pip._internal.main(list(args))
+        except SystemExit as e:
+            returncode = e.code or 0
+        finally:
+            sys.stdout = orig_stdout
+        return InMemoryPipResult(returncode, stdout.getvalue())
+
+
+@pytest.fixture
+def in_memory_pip():
+    return InMemoryPip()
+
+
+@pytest.fixture
+def deprecated_python():
+    """Used to indicate whether pip deprecated this python version"""
+    return sys.version_info[:2] in [(3, 4), (2, 7)]

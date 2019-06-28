@@ -9,7 +9,13 @@ def authors(ctx):
 
     # Get our list of authors
     print("[generate.authors] Collecting author names")
-    r = ctx.run("git log --use-mailmap --format'=%aN <%aE>'", hide=True)
+
+    # Note that it's necessary to use double quotes in the
+    # --format"=%aN <%aE>" part of the command, as the Windows
+    # shell doesn't recognise single quotes here.
+    r = ctx.run('git log --use-mailmap --format"=%aN <%aE>"',
+                encoding="utf-8", hide=True)
+
     authors = []
     seen_authors = set()
     for author in r.stdout.splitlines():
@@ -26,3 +32,16 @@ def authors(ctx):
     with io.open("AUTHORS.txt", "w", encoding="utf8") as fp:
         fp.write(u"\n".join(authors))
         fp.write(u"\n")
+
+
+@invoke.task
+def news(ctx, draft=False, yes=False):
+    print("[generate.news] Generating NEWS")
+
+    args = []
+    if draft:
+        args.append("--draft")
+    if yes:
+        args.append("--yes")
+
+    ctx.run("towncrier {}".format(" ".join(args)))

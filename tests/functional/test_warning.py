@@ -1,35 +1,22 @@
-import pytest
-
-PY26_WARNING = "Python 2.6 is no longer supported"
+import textwrap
 
 
-@pytest.mark.skipif("sys.version_info >= (2,7)")
-def test_python26_options(script):
-    result = script.run(
-        'python', '-m', 'pip.__main__', 'list', expect_stderr=True,
-    )
-    assert PY26_WARNING in result.stderr
-    result = script.run('python', '-W', 'ignore', '-m', 'pip.__main__', 'list')
-    assert result.stderr == ''
-
-
-@pytest.mark.skipif("sys.version_info < (2,7)")
 def test_environ(script, tmpdir):
     """$PYTHONWARNINGS was added in python2.7"""
     demo = tmpdir.join('warnings_demo.py')
-    demo.write('''
-from pip.utils import deprecation
-deprecation.install_warning_logger()
+    demo.write(textwrap.dedent('''
+        from logging import basicConfig
+        from pip._internal.utils import deprecation
 
-from logging import basicConfig
-basicConfig()
+        deprecation.install_warning_logger()
+        basicConfig()
 
-from warnings import warn
-warn("deprecated!", deprecation.PipDeprecationWarning)
-''')
+        deprecation.deprecated("deprecated!", replacement=None, gone_in=None)
+    '''))
 
     result = script.run('python', demo, expect_stderr=True)
-    assert result.stderr == 'ERROR:pip.deprecations:DEPRECATION: deprecated!\n'
+    expected = 'WARNING:pip._internal.deprecations:DEPRECATION: deprecated!\n'
+    assert result.stderr == expected
 
     script.environ['PYTHONWARNINGS'] = 'ignore'
     result = script.run('python', demo)

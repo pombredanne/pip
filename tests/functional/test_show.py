@@ -1,17 +1,19 @@
+import os
 import re
 
 import pytest
+
 from pip import __version__
-from pip.commands.show import search_packages_info
+from pip._internal.commands.show import search_packages_info
 
 
-def test_show(script):
+def test_basic_show(script):
     """
     Test end to end test for show command.
     """
     result = script.pip('show', 'pip')
     lines = result.stdout.splitlines()
-    assert len(lines) == 9
+    assert len(lines) == 10
     assert 'Name: pip' in lines
     assert 'Version: %s' % __version__ in lines
     assert any(line.startswith('Location: ') for line in lines)
@@ -27,7 +29,7 @@ def test_show_with_files_not_found(script, data):
     script.pip('install', '-e', editable)
     result = script.pip('show', '-f', 'SetupPyUTF8')
     lines = result.stdout.splitlines()
-    assert len(lines) == 11
+    assert len(lines) == 12
     assert 'Name: SetupPyUTF8' in lines
     assert 'Version: 0.0.0' in lines
     assert any(line.startswith('Location: ') for line in lines)
@@ -137,9 +139,10 @@ def test_all_fields(script):
     """
     result = script.pip('show', 'pip')
     lines = result.stdout.splitlines()
-    expected = set(['Name', 'Version', 'Summary', 'Home-page', 'Author',
-                    'Author-email', 'License', 'Location', 'Requires'])
-    actual = set(re.sub(':.*$', '', line) for line in lines)
+    expected = {'Name', 'Version', 'Summary', 'Home-page', 'Author',
+                'Author-email', 'License', 'Location', 'Requires',
+                'Required-by'}
+    actual = {re.sub(':.*$', '', line) for line in lines}
     assert actual == expected
 
 
@@ -152,12 +155,13 @@ def test_pip_show_is_short(script):
     assert len(lines) <= 10
 
 
-def test_pip_show_divider(script):
+def test_pip_show_divider(script, data):
     """
     Expect a divider between packages
     """
-    script.pip('install', 'initools')
-    result = script.pip('show', 'pip', 'initools')
+    script.pip('install', 'pip-test-package', '--no-index',
+               '-f', data.packages)
+    result = script.pip('show', 'pip', 'pip-test-package')
     lines = result.stdout.splitlines()
     assert "---" in lines
 
@@ -171,3 +175,19 @@ def test_package_name_is_canonicalized(script, data):
 
     assert underscore_upper_show_result.returncode == 0
     assert underscore_upper_show_result.stdout == dash_show_result.stdout
+
+
+def test_show_required_by_packages(script, data):
+    """
+    Test that installed packages that depend on this package are shown
+    """
+    editable_path = os.path.join(data.src, 'requires_simple')
+    script.pip(
+        'install', '--no-index', '-f', data.find_links, editable_path
+    )
+
+    result = script.pip('show', 'simple')
+    lines = result.stdout.splitlines()
+
+    assert 'Name: simple' in lines
+    assert 'Required-by: requires-simple' in lines

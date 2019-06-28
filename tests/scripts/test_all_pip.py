@@ -1,13 +1,12 @@
 import os
 import re
-import sys
 import subprocess
-from os.path import dirname, abspath
+import sys
+from os.path import abspath, dirname
 
 from pip._vendor.six.moves.urllib import request as urllib_request
 
-from pip.utils import rmtree
-
+from pip._internal.utils.misc import rmtree
 
 src_folder = dirname(dirname(abspath(__file__)))
 
@@ -18,7 +17,7 @@ else:
 
 
 def all_projects():
-    data = urllib_request.urlopen('http://pypi.python.org/simple/').read()
+    data = urllib_request.urlopen('http://pypi.org/simple/').read()
     projects = [m.group(1) for m in re.finditer(r'<a.*?>(.+)</a>', data)]
     return projects
 

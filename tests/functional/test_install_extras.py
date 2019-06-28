@@ -1,6 +1,7 @@
 import textwrap
-import pytest
 from os.path import join
+
+import pytest
 
 
 @pytest.mark.network
@@ -69,7 +70,7 @@ def test_nonexistent_extra_warns_user_no_wheel(script, data):
     assert (
         "simple 3.0 does not provide the extra 'nonexistent'"
         in result.stderr
-    )
+    ), str(result)
 
 
 def test_nonexistent_extra_warns_user_with_wheel(script, data):
@@ -100,13 +101,13 @@ def test_nonexistent_options_listed_in_order(script, data):
         'simplewheel[nonexistent, nope]', expect_stderr=True,
     )
     msg = (
-        "  simplewheel 2.0 does not provide the extra 'nonexistent'\n"
-        "  simplewheel 2.0 does not provide the extra 'nope'"
+        "  WARNING: simplewheel 2.0 does not provide the extra 'nonexistent'\n"
+        "  WARNING: simplewheel 2.0 does not provide the extra 'nope'"
     )
     assert msg in result.stderr
 
 
-def test_install_special_extra(script, data):
+def test_install_special_extra(script):
     # Check that uppercase letters and '-' are dealt with
     # make a dummy project
     pkga_path = script.scratch_path / 'pkga'

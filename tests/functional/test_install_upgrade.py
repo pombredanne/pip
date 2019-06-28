@@ -4,10 +4,7 @@ import textwrap
 
 import pytest
 
-from tests.lib import (
-    assert_all_changes, pyversion, _create_test_package,
-    _change_test_package_version,
-)
+from tests.lib import assert_all_changes, pyversion
 from tests.lib.local_repos import local_checkout
 
 
@@ -56,6 +53,10 @@ def test_only_if_needed_does_not_upgrade_deps_when_satisfied(script):
         (script.site_packages / 'simple-2.0-py%s.egg-info' % pyversion)
         not in result.files_deleted
     ), "should not have uninstalled simple==2.0"
+    assert (
+        "Requirement already satisfied, skipping upgrade: simple"
+        in result.stdout
+    ), "did not print correct message for not-upgraded requirement"
 
 
 def test_only_if_needed_does_upgrade_deps_when_no_longer_satisfied(script):
@@ -224,7 +225,7 @@ def test_uninstall_before_upgrade_from_url(script):
     )
     result2 = script.pip(
         'install',
-        'https://pypi.python.org/packages/source/I/INITools/INITools-'
+        'https://files.pythonhosted.org/packages/source/I/INITools/INITools-'
         '0.3.tar.gz',
         expect_error=True,
     )
@@ -246,7 +247,7 @@ def test_upgrade_to_same_version_from_url(script):
     )
     result2 = script.pip(
         'install',
-        'https://pypi.python.org/packages/source/I/INITools/INITools-'
+        'https://files.pythonhosted.org/packages/source/I/INITools/INITools-'
         '0.3.tar.gz',
         expect_error=True,
     )
@@ -314,31 +315,6 @@ def test_uninstall_rollback(script, data):
     )
 
 
-# Issue #530 - temporarily disable flaky test
-@pytest.mark.skipif
-def test_editable_git_upgrade(script):
-    """
-    Test installing an editable git package from a repository, upgrading the
-    repository, installing again, and check it gets the newer version
-    """
-    version_pkg_path = _create_test_package(script)
-    script.pip(
-        'install', '-e',
-        '%s#egg=version_pkg' % ('git+file://' + version_pkg_path),
-    )
-    version = script.run('version_pkg')
-    assert '0.1' in version.stdout
-    _change_test_package_version(script, version_pkg_path)
-    script.pip(
-        'install', '-e',
-        '%s#egg=version_pkg' % ('git+file://' + version_pkg_path),
-    )
-    version2 = script.run('version_pkg')
-    assert 'some different version' in version2.stdout, (
-        "Output: %s" % (version2.stdout)
-    )
-
-
 @pytest.mark.network
 def test_should_not_install_always_from_cache(script):
     """
@@ -379,7 +355,7 @@ def test_install_with_ignoreinstalled_requested(script):
 def test_upgrade_vcs_req_with_no_dists_found(script, tmpdir):
     """It can upgrade a VCS requirement that has no distributions otherwise."""
     req = "%s#egg=pip-test-package" % local_checkout(
-        "git+http://github.com/pypa/pip-test-package.git",
+        "git+https://github.com/pypa/pip-test-package.git",
         tmpdir.join("cache"),
     )
     script.pip("install", req)
@@ -401,7 +377,7 @@ def test_upgrade_vcs_req_with_dist_found(script):
     )
     script.pip("install", req, expect_stderr=True)
     result = script.pip("install", "-U", req, expect_stderr=True)
-    assert "pypi.python.org" not in result.stdout, result.stdout
+    assert "pypi.org" not in result.stdout, result.stdout
 
 
 class TestUpgradeDistributeToSetuptools(object):
@@ -448,27 +424,3 @@ class TestUpgradeDistributeToSetuptools(object):
             cwd=pip_src,
             expect_stderr=True,
         )
-
-    @pytest.mark.skipif(
-        sys.version_info >= (3, 5),
-        reason="distribute doesn't work on Python 3.5",
-    )
-    def test_from_distribute_6_to_setuptools_7(
-            self, script, data, virtualenv):
-        self.prep_ve(
-            script, '1.9.1', virtualenv.pip_source_dir, distribute=True
-        )
-        result = self.script.run(
-            self.ve_bin / 'pip', 'install', '--no-index',
-            '--find-links=%s' % data.find_links, '-U', 'distribute',
-            expect_stderr=True if sys.version_info[:2] == (2, 6) else False,
-        )
-        assert (
-            "Found existing installation: distribute 0.6.34" in result.stdout
-        )
-        result = self.script.run(
-            self.ve_bin / 'pip', 'list', '--format=legacy',
-            expect_stderr=True if sys.version_info[:2] == (2, 6) else False,
-        )
-        assert "setuptools (0.9.8)" in result.stdout
-        assert "distribute (0.7.3)" in result.stdout
